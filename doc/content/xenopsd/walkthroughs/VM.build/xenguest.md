@@ -70,7 +70,7 @@ Xenstore[Xenstore platform data] --> xenguest
 - The amount of system memory of the domain,
 - A number of other parameters that are domain-specific.
 
-Using the Xenstore, the platform data (vCPUs, vCPU affinity, etc) is passed:
+Using the Xenstore, the platform data (vCPUs, vCPU affinity, etc.) is passed:
 - the vCPU affinity
 - the vCPU credit2 weight/cap parameters
 - whether the NX bit is exposed

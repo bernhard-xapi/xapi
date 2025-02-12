@@ -53,21 +53,21 @@ to call:
   - Run `xenguest`
 - `xenguest` to invoke the [xenguest](xenguest) program to setup the domain's system memory.
 
-## Domain Build Preparation using build_pre
+## Build Preparation using <tt>build_pre</tt>
 
 [`Domain.build`](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L1111-L1210)
 [calls](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L1137)
-the [function `build_pre`](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L899-L964)
-(which is also used for VM restore). It must:
+[build_pre](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L899-L964)
+(which is also used for VM restore):
 
-1.  [Call](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L902-L911)
+1.  It [calls](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L902-L911)
     [wait_xen_free_mem](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L236-L272)
-    to wait, if necessary, for the Xen memory scrubber to catch up reclaiming memory (CA-39743)
-2.  Call the hypercall to set the timer mode
-3.  Call the hypercall to set the number of vCPUs
-4.  As described in the [NUMA feature description](../../toolstack/features/NUMA),
+    to wait (if necessary), for the Xen memory scrubber to catch up reclaiming memory (CA-39743)
+2.  It calls the hypercall to set the timer mode
+3.  It calls the hypercall to set the number of vCPUs
+4.  As described in the [NUMA feature description](/toolstack/features/NUMA),
     when the `xe` configuration option `numa_placement` is set to `Best_effort`,
-    except when the VM has a hard affinity set, invoke the `numa_placement` function:
+    (except when the VM has a hard affinity set), it invokes the `numa_placement` function:
 
     ```ml
     match !Xenops_server.numa_placement with
@@ -110,10 +110,22 @@ setting the vCPU affinity causes the Xen hypervisor to activate
 NUMA node affinity for memory allocations to be aligned with
 the vCPU affinity of the domain.
 
-Note: See the Xen domain's
-[auto_node_affinity](https://wiki.xenproject.org/wiki/NUMA_node_affinity_in_the_Xen_hypervisor)
-feature flag, which controls this, which can be overridden in the
-Xen hypervisor if needed for specific VMs.
+Summary: This passes the information to the hypervisor that memory
+allocation for this domain should preferably be done from this NUMA node.
+
+## Invoke the xenguest program
+
+With the preparation in `build_pre` completed, `Domain.build`
+[calls](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L1127-L1155)
+the `xenguest` function to invoke the [xenguest](xenguest) program to build the domain.
+
+## Food for thought on future improvements
+
+The Xen domain feature flag
+[domain->auto_node_affinity](https://wiki.xenproject.org/wiki/NUMA_node_affinity_in_the_Xen_hypervisor)
+can be disabled by calling
+[xc_domain_node_setaffinity()](https://github.com/xen-project/xen/blob/b2da4fc0/tools/libs/ctrl/xc_domain.c#L122-L158)
+to set a specific NUMA node affinity if needed for specific VMs:
 
 This can be used, for example, when there might not be enough memory
 on the preferred NUMA node, but there are other NUMA nodes that have
@@ -127,11 +139,3 @@ NUMA nodes only happens to the extent necessary.
 Likely, the future allocation strategy should be passed to `xenguest`
 using Xenstore like the other platform parameters for the VM.
 
-Summary: This passes the information to the hypervisor that memory
-allocation for this domain should preferably be done from this NUMA node.
-
-## Invoke the xenguest program
-
-With the preparation in `build_pre` completed, `Domain.build`
-[calls](https://github.com/xapi-project/xen-api/blob/master/ocaml/xenopsd/xc/domain.ml#L1127-L1155)
-the `xenguest` function to invoke the [xenguest](xenguest) program to build the domain.
