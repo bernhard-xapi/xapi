@@ -3,42 +3,114 @@ title: Flowchart of the use of xc_vcpu_setaffinity() by xenopsd
 description: Shows how xenopsd uses xc_vcpu_setaffinity() to set NUMA affinity
 hidden: true
 ---
+Two code paths are set in bold to show
+- when numa_affinity_policy is the default (off) in `xenopsd`.
+- when `xc_vcpu_setaffinity(XEN_VCPUAFFINITY_SOFT)` is called in Xen,
+  and the auto_node_affinity flag is enabled (default),
+  which updates the node_affinity as well.
+
 ```mermaid
 flowchart TD
-subgraph xenopsd["xenopsd VM.build"]
 
-Host.numa_affinity_policy{<tt>Host.numa_affinity_policy</tt><br>is}
-    --best_effort-->numa_placement-->XenStore
+subgraph VM.create["xenopsd VM.create"]
+
+    %% Is xe vCPU-params:mask= set? If yes, write to Xenstore:
+
+    is_xe_vCPUparams_mask_set?{"
+
+            Is
+            <tt>xe vCPU-params:mask=</tt>
+            set? Example: <tt>1,2,3</tt>
+            (Is used to enable vCPU<br>hard-affinity)
+
+        "} --"yes"--> set_hard_affinity("Write hard-affinity to XenStore:
+                        <tt>platform/vcpu/#domid/affinity</tt>")
+
 end
+
+subgraph VM.build["xenopsd VM.build"]
+
+    %% Labels of the decision nodes
+
+    is_Host.numa_affinity_policy_set?{
+        Is<p><tt>Host.numa_affinity_policy</tt><p>set?}
+    has_hard_affinity?{
+        Is hard-affinity configured in <p><tt>platform/vcpu/#domid/affinity</tt>?}
+
+    %% Connections from VM.create:
+    set_hard_affinity --> is_Host.numa_affinity_policy_set?
+    is_xe_vCPUparams_mask_set? == "no"==> is_Host.numa_affinity_policy_set?
+
+    %% The Subgraph itself:
+
+    %% Check Host.numa_affinity_policy
+
+    is_Host.numa_affinity_policy_set?
+
+        %% If Host.numa_affinity_policy is "best_effort":
+
+        -- Host.numa_affinity_policy is<p><tt>best_effort -->
+
+            %% If has_hard_affinity is set, skip numa_placement:
+
+            has_hard_affinity?
+                --"yes"-->exec_xenguest
+
+            %% If has_hard_affinity is not set, run numa_placement:
+
+            has_hard_affinity?
+                --"no"-->numa_placement-->exec_xenguest
+
+        %% If Host.numa_affinity_policy is off (default, for now),
+        %% skip NUMA placement:
+
+        is_Host.numa_affinity_policy_set?
+            =="default: disabled"==>
+            exec_xenguest
+end
+
+%% xenguest subgraph
 
 subgraph xenguest
-Host.numa_affinity_policy=="default: disabled"==>stub_xc_hvm_build
-XenStore(Add to Xenstore:<br><tt>platform/vcpu/#domid/affinity</tt>)-->
-    stub_xc_hvm_build("<tt>stub_xc_hvm_build()")
-    ==> configure_vcpus("<tT>configure_vcpus()")
-        ==> affinity_set{"Is<br><tt>platform/vcpu/#domid/affinity</tt><br>set?"}
-            =="affinity is found (automatically only set on <tt>numa_placement</tt> success)"==>
-                xc_vcpu_setaffinity("<tt>xc_vcpu_setaffinity()")
 
-    stub_xc_hvm_build["<tt>stub_xc_hvm_build()"]
-        <==> get_flags["<tt>get_flags()</tt><br>gets Xenstore platform data"]
+    exec_xenguest
 
-    subgraph xenctrl[XenCtrl]
-        xc_vcpu_setaffinity
-        xc_domain_node_setaffinity
-    end
+        ==> stub_xc_hvm_build("<tt>stub_xc_hvm_build()")
+
+            ==> configure_vcpus("<tT>configure_vcpus()")
+
+                %% Decision
+                ==> set_hard_affinity?{"
+                        Is <tt>platform/<br>vcpu/#domid/affinity</tt>
+                        set?"}
+
 end
 
-xc_vcpu_setaffinity ==Currently used hypercall==> do_domctl
-xc_domain_node_setaffinity --Currently not used by the Xapi toolstack--> do_domctl
+%% do_domctl Hypercalls
+
+numa_placement
+    --Set the NUMA placement using soft-affinity-->
+    XEN_VCPUAFFINITY_SOFT("<tt>xc_vcpu_setaffinity(SOFT)")
+        ==> do_domctl
+
+set_hard_affinity?
+    --yes-->
+    XEN_VCPUAFFINITY_HARD("<tt>xc_vcpu_setaffinity(HARD)")
+        --> do_domctl
+
+xc_domain_node_setaffinity
+    --Currently not used by the Xapi toolstack
+        --> do_domctl
+
+%% Xen subgraph
 
 subgraph xen[Xen Hypervisor]
 
     subgraph domain_update_node_affinity["domain_update_node_affinity()"]
         domain_update_node_aff("<tt>domain_update_node_aff()")
-        ==> check_auto_node{"Is<br><tt>d->auto_node_affinity</tt><br>enabled?"}
+        ==> check_auto_node{"Is domain's<br><tt>auto_node_affinity</tt><br>enabled?"}
           =="yes (default)"==>set_node_affinity_from_vcpu_affinities("
-            Set the domain's <tt>node_affinity</tt> mask as well
+            Calculate the domain's <tt>node_affinity</tt> mask from vCPU affinity
             (used for further NUMA memory allocation for the domain)")
     end
 
@@ -48,20 +120,37 @@ subgraph xen[Xen Hypervisor]
                 ==>domain_update_node_aff
     do_domctl
         --XEN_DOMCTL_setnodeaffinity (not used currently)
-            -->nodes_full
+            -->is_new_affinity_all_nodes?
 
     subgraph  domain_set_node_affinity["domain_set_node_affinity()"]
-        nodes_full{new_affinity<br>is #34;all#34;?}
-            --is #34;all#34;-->
-                set_auto("<tt>auto_node_affinity=1")-->
-                    domain_update_node_aff
-        nodes_full
-            --not #34;all#34;-->fixed("<tt>auto_node_affinity=0
-            node_affinity=new_affinity")
-            -->domain_update_node_aff
+
+        is_new_affinity_all_nodes?{new_affinity<br>is #34;all#34;?}
+
+            --is #34;all#34;
+
+                --> enable_auto_node_affinity("<tt>auto_node_affinity=1")
+                    --> domain_update_node_aff
+
+        is_new_affinity_all_nodes?
+
+            --not #34;all#34;
+
+                --> disable_auto_node_affinity("<tt>auto_node_affinity=0")
+                    --> domain_update_node_aff
     end
+
+%% setting and getting the struct domain's node_affinity:
+
+disable_auto_node_affinity
+    --node_affinity=new_affinity-->
+        domain_node_affinity
+
+set_node_affinity_from_vcpu_affinities
+    ==> domain_node_affinity@{ shape: bow-rect,label: "domain:&nbsp;node_affinity" }
+        --XEN_DOMCTL_getnodeaffinity--> do_domctl
+
 end
-click Host.numa_affinity_policy
+click is_Host.numa_affinity_policy_set?
 "https://github.com/xapi-project/xen-api/blob/90ef043c1f3a3bc20f1c5d3ccaaf6affadc07983/ocaml/xenopsd/xc/domain.ml#L951-L962"
 click numa_placement
 "https://github.com/xapi-project/xen-api/blob/90ef043c/ocaml/xenopsd/xc/domain.ml#L862-L897"
@@ -75,7 +164,7 @@ click domain_set_node_affinity
 "https://github.com/xen-project/xen/blob/7cf163879/xen/common/domain.c#L943-L970" _blank
 click configure_vcpus
 "https://github.com/xenserver/xen.pg/blob/65c0438b/patches/xenguest.patch#L1297-L1348" _blank
-click affinity_set
+click set_hard_affinity?
 "https://github.com/xenserver/xen.pg/blob/65c0438b/patches/xenguest.patch#L1305-L1326" _blank
 click xc_vcpu_setaffinity
 "https://github.com/xen-project/xen/blob/7cf16387/tools/libs/ctrl/xc_domain.c#L199-L250" _blank
