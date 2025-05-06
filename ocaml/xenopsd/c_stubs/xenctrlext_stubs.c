@@ -111,7 +111,7 @@ CAMLprim value stub_xenctrlext_interface_open(value unused)
 CAMLprim value stub_xenctrlext_get_runstate_info(value xch_val, value domid)
 {
 	CAMLparam2(xch_val, domid);
-#if defined(XENCTRL_HAS_GET_RUNSTATE_INFO)
+#if defined(XENCTRL_HAS_GET_RUNSTATE_INFO_V2)
 	CAMLlocal1(result);
 	xc_runstate_info_t info;
 	int retval;
@@ -125,7 +125,7 @@ CAMLprim value stub_xenctrlext_get_runstate_info(value xch_val, value domid)
 	   0 : state (int32)
 	   1 : missed_changes (int32)
 	   2 : state_entry_time (int64)
-	   3-8 : times (int64s)
+	   3-12 : times (int64s)
 	*/
 	result = caml_alloc_tuple(9);
 	Store_field(result, 0, caml_copy_int32(info.state));
@@ -137,10 +137,14 @@ CAMLprim value stub_xenctrlext_get_runstate_info(value xch_val, value domid)
 	Store_field(result, 6, caml_copy_int64(info.time[3]));
 	Store_field(result, 7, caml_copy_int64(info.time[4]));
 	Store_field(result, 8, caml_copy_int64(info.time[5]));
+    Store_field(result, 9, caml_copy_int64(info.time[6]));
+    Store_field(result, 10, caml_copy_int64(info.time[7]));
+    Store_field(result, 11, caml_copy_int64(info.time[8]));
+    Store_field(result, 12, caml_copy_int64(info.time[9]));
 
 	CAMLreturn(result);
 #else
-	caml_failwith("XENCTRL_HAS_GET_RUNSTATE_INFO not defined");
+	caml_failwith("XENCTRL_HAS_GET_RUNSTATE_INFO_V2 not defined");
 #endif
 }
 

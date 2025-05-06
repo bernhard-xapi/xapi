@@ -106,6 +106,39 @@ let dss_vcpus xc doms =
                     blocked"
                  ~ty:Rrd.Derive ~default:false ~min:0.0 ()
              )
+          (* ri.Xenctrl.time7 (DOMAIN_RUNSTATE_vcputime_running_affine), relative to *)
+          (* ri.Xenctrl.time6 (DOMAIN_RUNSTATE_vcputime_total *)
+          :: ( Rrd.VM uuid
+             , Ds.ds_make ~name:"runstate_running_affine"
+                 ~units:"(fraction)"
+                 ~value:(Rrd.VT_Float (Int64.to_float ri.Xenctrl.time7 /. ri.Xenctrl.time6))
+                 ~description:
+                   "Fraction of time that some VCPUs are runnable and some are \
+                    blocked"
+                 ~ty:Rrd.Derive ~default:false ~min:0.0 ()
+             )
+          (* ri.Xenctrl.time8 (DOMAIN_RUNSTATE_vcputime_running_non_affine), relative to *)
+          (* ri.Xenctrl.time6 (DOMAIN_RUNSTATE_vcputime_total)  *)
+          :: ( Rrd.VM uuid
+             , Ds.ds_make ~name:"runstate_running_non_affine"
+                 ~units:"(fraction)"
+                 ~value:(Rrd.VT_Float (Int64.to_float ri.Xenctrl.time8 /. ri.Xenctrl.time6))
+                 ~description:
+                   "Fraction of time that some VCPUs are runnable and some are \
+                    blocked"
+                 ~ty:Rrd.Derive ~default:false ~min:0.0 ()
+             )
+          (* ri.Xenctrl.time9 (DOMAIN_RUNSTATE_vcputime_runnable), relative to *)
+          (* ri.Xenctrl.time6 (DOMAIN_RUNSTATE_vcputime_total)  *) *)
+          :: ( Rrd.VM uuid
+             , Ds.ds_make ~name:"runstate_runnable"
+                 ~units:"(fraction)"
+                 ~value:(Rrd.VT_Float (Int64.to_float ri.Xenctrl.time9 /. ri.Xenctrl.time6))
+                 ~description:
+                   "Fraction of time that some VCPUs are runnable and some are \
+                    blocked"
+                 ~ty:Rrd.Derive ~default:false ~min:0.0 ()
+             )
           :: ( Rrd.VM uuid
              , Ds.ds_make
                  ~name:(Printf.sprintf "cpu_usage")
