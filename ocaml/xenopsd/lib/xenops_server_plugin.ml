@@ -84,6 +84,8 @@ module type S = sig
       -> Vm.t
       -> Vm.id option
       -> bool (* no_sharept*)
+      -> int (* num_of_vbds *)
+      -> int (* num_of_vifs *)
       -> unit
 
     val build :
@@ -207,9 +209,15 @@ module type S = sig
 
     val epoch_end : Xenops_task.task_handle -> Vm.id -> disk -> unit
 
-    val plug : Xenops_task.task_handle -> Vm.id -> Vbd.t -> unit
+    val attach : Xenops_task.task_handle -> Vm.id -> Vbd.t -> unit
+
+    val activate : Xenops_task.task_handle -> Vm.id -> Vbd.t -> unit
 
     val unplug : Xenops_task.task_handle -> Vm.id -> Vbd.t -> bool -> unit
+
+    val deactivate : Xenops_task.task_handle -> Vm.id -> Vbd.t -> bool -> unit
+
+    val detach : Xenops_task.task_handle -> Vm.id -> Vbd.t -> unit
 
     val insert : Xenops_task.task_handle -> Vm.id -> Vbd.t -> disk -> unit
 
@@ -284,10 +292,7 @@ module type S = sig
   end
 
   module UPDATES : sig
-    val get :
-         Updates.id option
-      -> int option
-      -> Dynamic.barrier list * Dynamic.id list * Updates.id
+    val get : Updates.id option -> int option -> Updates.get_result
   end
 
   module DEBUG : sig

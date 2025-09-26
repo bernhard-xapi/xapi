@@ -16,7 +16,7 @@
  * It is still possible to convert it to Rpc.t and recover it that way,
  * it is not a protection against willfully recovering the protected string
  * (we do need to send these as parameters in RPCs).
- * *)
+ *)
 
 (** a type with no direct conversions to string *)
 type t
@@ -24,6 +24,8 @@ type t
 val of_string : string -> t
 
 val equal : t -> t -> bool
+
+val length : t -> int
 
 val json_rpc_of_t : t -> Rpc.t
 

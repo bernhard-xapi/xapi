@@ -177,6 +177,20 @@ let hvm_boot_params_order = "order"
 
 let hvm_default_boot_order = "cd"
 
+(** Keys for different CPUID policies in {Host,Pool}.cpu_info *)
+
+let cpu_info_vendor_key = "vendor"
+
+let cpu_info_features_key = "features"
+
+let cpu_info_features_pv_key = "features_pv"
+
+let cpu_info_features_hvm_key = "features_hvm"
+
+let cpu_info_features_pv_host_key = "features_pv_host"
+
+let cpu_info_features_hvm_host_key = "features_hvm_host"
+
 (* Key we put in VM.other_config when we upgrade a VM from Zurich/Geneva to Rio *)
 let vm_upgrade_time = "upgraded at"
 
@@ -218,6 +232,11 @@ let master_scripts = "master_scripts"
 (* This flag is set when we commit to rebooting or shutting down the host when HA is enabled.
    This will prevent anyone from re-enabling the host and starting VMs on it during shutdown. *)
 let host_disabled_until_reboot = "host_disabled_until_reboot"
+
+(* This flag is set to false when the host is forcibly disabled in a
+   persistent way - it will not be re-enabled on startup (even after reboots)
+   until manually directed by the user *)
+let host_auto_enable = "host_auto_enable"
 
 (* Set when shutting down and rebooting. If we come up and finds no new crashdump and HA is enabled,
    we assume the host was fenced. *)
@@ -422,3 +441,11 @@ let observer_components_all =
 let tgroups_enabled = ref false
 
 let when_tgroups_enabled f = if !tgroups_enabled then f () else ()
+
+let default_ssh_enabled = true
+
+let default_ssh_enabled_timeout = 0L
+
+let default_console_idle_timeout = 0L
+
+let default_ssh_auto_mode = false

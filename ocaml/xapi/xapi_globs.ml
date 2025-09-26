@@ -151,6 +151,10 @@ let _dbv = "dbv"
 
 let _db_schema = "db_schema"
 
+let _xapi_build_version = "xapi_build"
+
+let _xen_version = "xen"
+
 (* When comparing two host versions, always treat a host that has platform_version defined as newer
  * than any host that does not have platform_version defined.
  * Substituting this default when a host does not have platform_version defined will be acceptable,
@@ -368,6 +372,8 @@ let sync_bios_strings = "sync_bios_strings"
 
 let sync_chipset_info = "sync_chipset_info"
 
+let sync_ssh_status = "sync_ssh_status"
+
 let sync_pci_devices = "sync_pci_devices"
 
 let sync_gpus = "sync_gpus"
@@ -433,6 +439,10 @@ let xapi_clusterd_port = ref 8896
  * This stunnel client will proxy the access to the internal YUM repo on pool master.
  *)
 let local_yum_repo_port = ref 8000
+
+(* The maximum number of start attempts for HA best-effort VMs. Each attempt is
+   spaced 20 seconds apart. *)
+let ha_best_effort_max_retries = ref 2
 
 (* When a host is known to be shutting down or rebooting, we add it's reference in here.
    This can be used to force the Host_metrics.live flag to false. *)
@@ -500,6 +510,16 @@ let rpu_allowed_vm_operations =
   ; `update_allowed_operations
   ]
 
+module Vdi_operations = struct
+  type t = API.vdi_operations
+
+  (* this is more efficient than just 'let compare = Stdlib.compare',
+     because the compiler can specialize it to [t] without calling any runtime functions *)
+  let compare (a : t) (b : t) = Stdlib.compare a b
+end
+
+module Vdi_operations_set = Set.Make (Vdi_operations)
+
 (* Until the Ely release, the vdi_operations enum had stayed unchanged
  * since 2009 or earlier, but then Ely and some subsequent releases
  * added new members to the enum. *)
@@ -517,6 +537,7 @@ let pre_ely_vdi_operations =
   ; `generate_config
   ; `blocked
   ]
+  |> Vdi_operations_set.of_list
 
 (* We might consider restricting this further. *)
 let rpu_allowed_vdi_operations = pre_ely_vdi_operations
@@ -618,27 +639,11 @@ let auth_type_PAM = "PAM"
 
 let event_hook_auth_on_xapi_initialize_succeeded = ref false
 
-(** {2 CPUID feature masking} *)
-
-let cpu_info_vendor_key = "vendor"
-
-let cpu_info_features_key = "features"
-
-let cpu_info_features_pv_key = "features_pv"
-
-let cpu_info_features_hvm_key = "features_hvm"
-
-let cpu_info_features_pv_host_key = "features_pv_host"
-
-let cpu_info_features_hvm_host_key = "features_hvm_host"
-
 (** Metrics *)
 
 let metrics_root = "/dev/shm/metrics"
 
-let metrics_prefix_mem_host = "xcp-rrdd-mem_host"
-
-let metrics_prefix_mem_vms = "xcp-rrdd-mem_vms"
+let metrics_prefix_mem = "xcp-rrdd-squeezed"
 
 let metrics_prefix_pvs_proxy = "pvsproxy-"
 
@@ -744,7 +749,7 @@ let ha_default_timeout_base = ref 60.
 let guest_liveness_timeout = ref 300.
 
 (** The default time, in µs, in which tapdisk3 will keep polling the vbd ring buffer in expectation for extra requests from the guest *)
-let default_vbd3_polling_duration = ref 1000
+let default_vbd3_polling_duration = ref 8000
 
 (** The default % of idle dom0 cpu above which tapdisk3 will keep polling the vbd ring buffer *)
 let default_vbd3_polling_idle_threshold = ref 50
@@ -805,6 +810,10 @@ let pbis_force_domain_leave_script = ref "pbis-force-domain-leave"
 let sparse_dd = ref "sparse_dd"
 
 let vhd_tool = ref "vhd-tool"
+
+let qcow_to_stdout = ref "/opt/xensource/libexec/qcow2-to-stdout.py"
+
+let qcow_stream_tool = ref "qcow-stream-tool"
 
 let fence = ref "fence"
 
@@ -921,6 +930,13 @@ let gen_pool_secret_script = ref "/usr/bin/pool_secret_wrapper"
 
 let repository_domain_name_allowlist = ref []
 
+(*
+    This blocklist aims to prevent the creation of any repository whose URL matches an entry in the blocklist.
+    Additionally, if an existing repository contains a URL that matches an entry in the blocklist,
+    it should be removed automatically after xapi is restarted.
+*)
+let repository_url_blocklist = ref []
+
 let yum_cmd = ref "/usr/bin/yum"
 
 let dnf_cmd = ref "/usr/bin/dnf"
@@ -999,10 +1015,14 @@ let winbind_cache_time = ref 60
 
 let winbind_machine_pwd_timeout = ref (2. *. 7. *. 24. *. 3600.)
 
+let winbind_dns_sync_interval = ref 3600.
+
 let winbind_update_closest_kdc_interval = ref (3600. *. 22.)
 (* every 22 hours *)
 
 let winbind_kerberos_encryption_type = ref Kerberos_encryption_types.Winbind.All
+
+let winbind_set_machine_account_kerberos_encryption_type = ref false
 
 let winbind_allow_kerberos_auth_fallback = ref false
 
@@ -1039,9 +1059,13 @@ let trace_log_dir = ref "/var/log/dt/zipkinv2/json"
 
 let export_interval = ref 30.
 
+let export_chunk_size = ref 10000
+
 let max_spans = ref 10000
 
 let max_traces = ref 10000
+
+let max_span_depth = ref 100
 
 let use_xmlrpc = ref true
 
@@ -1081,10 +1105,17 @@ let reuse_pool_sessions = ref false
 let validate_reusable_pool_session = ref false
 (* Validate a reusable session before each use. This is slower and should not be required *)
 
+let vm_sysprep_enabled = ref false
+(* enable VM.sysprep API *)
+
+let vm_sysprep_wait = ref 5.0 (* seconds *)
+
 let test_open = ref 0
 
 let xapi_requests_cgroup =
   "/sys/fs/cgroup/cpu/control.slice/xapi.service/request"
+
+let genisoimage_path = ref "/usr/bin/genisoimage"
 
 (* Event.{from,next} batching delays *)
 let make_batching name ~delay_before ~delay_between =
@@ -1199,6 +1230,7 @@ let xapi_globs_spec =
   ; ("winbind_debug_level", Int winbind_debug_level)
   ; ("winbind_cache_time", Int winbind_cache_time)
   ; ("winbind_machine_pwd_timeout", Float winbind_machine_pwd_timeout)
+  ; ("winbind_dns_sync_interval", Float winbind_dns_sync_interval)
   ; ( "winbind_update_closest_kdc_interval"
     , Float winbind_update_closest_kdc_interval
     )
@@ -1218,6 +1250,7 @@ let xapi_globs_spec =
   ; ("max_observer_file_size", Int max_observer_file_size)
   ; ("test-open", Int test_open) (* for consistency with xenopsd *)
   ; ("local_yum_repo_port", Int local_yum_repo_port)
+  ; ("ha_best_effort_max_retries", Int ha_best_effort_max_retries)
   ]
 
 let xapi_globs_spec_with_descriptions =
@@ -1287,6 +1320,16 @@ let gpumon_stop_timeout = ref 10.0
 
 let reboot_required_hfxs = ref "/run/reboot-required.hfxs"
 
+let console_timeout_profile_path = ref "/etc/profile.d/console_timeout.sh"
+
+let job_for_disable_ssh = ref "Disable SSH"
+
+let ssh_service = ref "sshd"
+
+let ssh_monitor_service = ref "xapi-ssh-monitor"
+
+let ssh_auto_mode_default = ref true
+
 (* Fingerprint of default patch key *)
 let citrix_patch_key =
   "NERDNTUzMDMwRUMwNDFFNDI4N0M4OEVCRUFEMzlGOTJEOEE5REUyNg=="
@@ -1310,18 +1353,14 @@ let gen_list_option name desc of_string string_of opt =
 let sm_plugins = ref []
 
 let accept_sm_plugin name =
-  List.(
-    fold_left ( || ) false
-      (map
-         (function
-           | `All ->
-               true
-           | `Sm x ->
-               String.lowercase_ascii x = String.lowercase_ascii name
-           )
-         !sm_plugins
+  List.exists
+    (function
+      | `All ->
+          true
+      | `Sm x ->
+          String.lowercase_ascii x = String.lowercase_ascii name
       )
-  )
+    !sm_plugins
 
 let nvidia_multi_vgpu_enabled_driver_versions =
   ref ["430.42"; "430.62"; "440.00+"]
@@ -1546,6 +1585,14 @@ let other_options =
     , "Encryption types to use when operating as Kerberos client \
        [strong|legacy|all]"
     )
+  ; ( "winbind_set_machine_account_kerberos_encryption_type"
+    , Arg.Set winbind_set_machine_account_kerberos_encryption_type
+    , (fun () ->
+        string_of_bool !winbind_set_machine_account_kerberos_encryption_type
+      )
+    , "Whether set machine account encryption type \
+       (msDS-SupportedEncryptionTypes) on domain controller"
+    )
   ; ( "winbind_allow_kerberos_auth_fallback"
     , Arg.Set winbind_allow_kerberos_auth_fallback
     , (fun () -> string_of_bool !winbind_allow_kerberos_auth_fallback)
@@ -1578,6 +1625,11 @@ let other_options =
       (fun s -> s)
       (fun s -> s)
       repository_domain_name_allowlist
+  ; gen_list_option "repository-url-blocklist"
+      "space-separated list of blocked URL patterns in base URL in repository."
+      (fun s -> s)
+      (fun s -> s)
+      repository_url_blocklist
   ; ( "repository-gpgcheck"
     , Arg.Set repository_gpgcheck
     , (fun () -> string_of_bool !repository_gpgcheck)
@@ -1631,6 +1683,11 @@ let other_options =
     , Arg.Set_float export_interval
     , (fun () -> string_of_float !export_interval)
     , "The interval for exports in Tracing"
+    )
+  ; ( "export-chunk-size"
+    , Arg.Set_int export_chunk_size
+    , (fun () -> string_of_int !export_chunk_size)
+    , "The span chunk size for exports in Tracing"
     )
   ; ( "max-spans"
     , Arg.Set_int max_spans
@@ -1723,6 +1780,27 @@ let other_options =
     , (fun () -> string_of_bool !validate_reusable_pool_session)
     , "Enable validation of reusable pool sessions before use"
     )
+  ; ( "ssh-auto-mode"
+    , Arg.Bool (fun b -> ssh_auto_mode_default := b)
+    , (fun () -> string_of_bool !ssh_auto_mode_default)
+    , "Defaults to true; overridden to false via \
+       /etc/xapi.conf.d/ssh-auto-mode.conf(e.g., in XenServer 8)"
+    )
+  ; ( "vm-sysprep-enabled"
+    , Arg.Set vm_sysprep_enabled
+    , (fun () -> string_of_bool !vm_sysprep_enabled)
+    , "Enable VM.sysprep API"
+    )
+  ; ( "vm-sysprep-wait"
+    , Arg.Set_float vm_sysprep_wait
+    , (fun () -> string_of_float !vm_sysprep_wait)
+    , "Time in seconds to wait for VM to recognise inserted CD"
+    )
+  ; ( "max-span-depth"
+    , Arg.Set_int max_span_depth
+    , (fun () -> string_of_int !max_span_depth)
+    , "The maximum depth to which spans are recorded in a trace in Tracing"
+    )
   ]
 
 (* The options can be set with the variable xapiflags in /etc/sysconfig/xapi.
@@ -1769,6 +1847,8 @@ module Resources = struct
       )
     ; ("sparse_dd", sparse_dd, "Path to sparse_dd")
     ; ("vhd-tool", vhd_tool, "Path to vhd-tool")
+    ; ("qcow_to_stdout", qcow_to_stdout, "Path to qcow-to-stdout script")
+    ; ("qcow_stream_tool", qcow_stream_tool, "Path to qcow-stream-tool")
     ; ("fence", fence, "Path to fence binary, used for HA host fencing")
     ; ( "host-bugreport-upload"
       , host_bugreport_upload
@@ -1914,6 +1994,7 @@ module Resources = struct
       , pvsproxy_close_cache_vdi
       , "Path to close-cache-vdi.sh"
       )
+    ; ("genisoimage", genisoimage_path, "Path to genisoimage")
     ]
 
   let essential_files =

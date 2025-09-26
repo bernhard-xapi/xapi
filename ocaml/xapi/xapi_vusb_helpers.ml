@@ -16,8 +16,6 @@ open Xapi_stdext_std.Xstringext
 
 module D = Debug.Make (struct let name = "xapi_vusb_helpers" end)
 
-open D
-
 (**************************************************************************************)
 (* current/allowed operations checking                                                *)
 
@@ -31,11 +29,11 @@ let valid_operations ~__context record _ref' : table =
   let _ref = Ref.string_of _ref' in
   let current_ops = record.Db_actions.vUSB_current_operations in
   (* Policy:
-     * one operation at a time
-     * a running VM can do plug depending on whether the VUSB is already attached to VM.
-     * a running VM can do unplug depending on whether the VUSB is already attached to VM.
-     *
-  *)
+   * one operation at a time
+   * a running VM can do plug depending on whether the VUSB is already attached to VM.
+   * a running VM can do unplug depending on whether the VUSB is already attached to VM.
+   *
+   *)
   let table : table = Hashtbl.create 10 in
   List.iter (fun x -> Hashtbl.replace table x None) all_ops ;
   let set_errors (code : string) (params : string list)
@@ -48,18 +46,20 @@ let valid_operations ~__context record _ref' : table =
       ops
   in
   (* Any current_operations preclude everything else *)
-  if current_ops <> [] then (
-    debug "No operations are valid because current-operations = [ %s ]"
-      (String.concat "; "
-         (List.map
-            (fun (task, op) -> task ^ " -> " ^ vusb_operations_to_string op)
-            current_ops
-         )
-      ) ;
-    let concurrent_op = snd (List.hd current_ops) in
-    set_errors Api_errors.other_operation_in_progress
-      ["VUSB"; _ref; vusb_operations_to_string concurrent_op]
-      all_ops
+  ( if current_ops <> [] then
+      let concurrent_op_refs, concurrent_op_types =
+        List.fold_left
+          (fun (refs, types) (ref, op) ->
+            (ref :: refs, vusb_operations_to_string op :: types)
+          )
+          ([], []) current_ops
+      in
+      let format x = Printf.sprintf "{%s}" (String.concat "; " x) in
+      let concurrent_op_refs = format concurrent_op_refs in
+      let concurrent_op_types = format concurrent_op_types in
+      set_errors Api_errors.other_operation_in_progress
+        ["VUSB"; _ref; concurrent_op_types; concurrent_op_refs]
+        all_ops
   ) ;
   let vm = Db.VUSB.get_VM ~__context ~self:_ref' in
   let power_state = Db.VM.get_power_state ~__context ~self:vm in

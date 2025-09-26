@@ -65,7 +65,7 @@ let update_allowed_operations ~__context ~self =
 let assert_can_boot_here ~__context ~self ~host =
   let snapshot = Db.VM.get_record ~__context ~self in
   if Helpers.rolling_upgrade_in_progress ~__context then
-    Helpers.assert_platform_version_is_same_on_master ~__context ~host ~self ;
+    Helpers.assert_host_versions_are_same_on_master ~__context ~host ~self ;
   assert_can_boot_here ~__context ~self ~host ~snapshot ~do_cpuid_check:true ()
 
 let retrieve_wlb_recommendations ~__context ~vm =
@@ -88,9 +88,6 @@ let retrieve_wlb_recommendations ~__context ~vm =
     (retrieve_wlb_recommendations ~__context ~vm ~snapshot)
 
 let assert_agile ~__context ~self = Agility.vm_assert_agile ~__context ~self
-
-(* helpers *)
-let immediate_complete ~__context = Helpers.progress ~__context (0.0 -. 1.0)
 
 (* API *)
 let set_actions_after_crash ~__context ~self ~value =
@@ -1171,6 +1168,11 @@ let call_plugin ~__context ~vm ~plugin ~fn ~args =
          (Api_errors.xenapi_plugin_failure, ["failed to execute fn"; msg; msg])
       )
 
+let call_host_plugin ~__context ~vm ~plugin ~fn ~args =
+  (* vm is unused; was used to find the host *)
+  let _ = vm in
+  Xapi_plugins.call_plugin (Context.get_session_id __context) plugin fn args
+
 let send_sysrq ~__context ~vm:_ ~key:_ =
   raise (Api_errors.Server_error (Api_errors.not_implemented, ["send_sysrq"]))
 
@@ -1349,11 +1351,11 @@ let set_suspend_VDI ~__context ~self ~value =
   let dst_vdi = value in
   if src_vdi <> dst_vdi then (
     (*
-	 * We don't care if the future host can see current suspend VDI or not, but
-	 * we want to make sure there's at least a host can see all the VDIs of the
-	 * VM + the new suspend VDI. We raise an exception if there's no suitable
-	 * host.
-	 *)
+     * We don't care if the future host can see current suspend VDI or not, but
+     * we want to make sure there's at least a host can see all the VDIs of the
+     * VM + the new suspend VDI. We raise an exception if there's no suitable
+     * host.
+     *)
     let vbds = Db.VM.get_VBDs ~__context ~self in
     let vbds =
       List.filter (fun self -> not (Db.VBD.get_empty ~__context ~self)) vbds
@@ -1613,7 +1615,7 @@ let nvram = Mutex.create ()
 let set_NVRAM_EFI_variables ~__context ~self ~value =
   with_lock nvram (fun () ->
       (* do not use remove_from_NVRAM: we do not want to
-         * temporarily end up with an empty NVRAM in HA *)
+       * temporarily end up with an empty NVRAM in HA *)
       let key = "EFI-variables" in
       let nvram = Db.VM.get_NVRAM ~__context ~self in
       let value = (key, value) :: List.remove_assoc key nvram in
@@ -1699,3 +1701,46 @@ let get_secureboot_readiness ~__context ~self =
           )
       )
     )
+
+let sysprep ~__context ~self ~unattend ~timeout =
+  let uuid = Db.VM.get_uuid ~__context ~self in
+  debug "%s %S (timeout %f)" __FUNCTION__ uuid timeout ;
+  if timeout < 0.0 then
+    raise
+      Api_errors.(
+        Server_error (invalid_value, ["timeout"; string_of_float timeout])
+      ) ;
+  match Vm_sysprep.sysprep ~__context ~vm:self ~unattend ~timeout with
+  | () ->
+      debug "%s %S success" __FUNCTION__ uuid ;
+      ()
+  | exception Vm_sysprep.Sysprep API_not_enabled ->
+      raise Api_errors.(Server_error (sysprep, [uuid; "API call is disabled"]))
+  | exception Vm_sysprep.Sysprep VM_CDR_not_found ->
+      raise Api_errors.(Server_error (sysprep, [uuid; "CD-ROM drive not found"]))
+  | exception Vm_sysprep.Sysprep VM_misses_feature ->
+      raise
+        Api_errors.(
+          Server_error (sysprep, [uuid; "VM driver does not support sysprep"])
+        )
+  | exception Vm_sysprep.Sysprep VM_not_running ->
+      raise Api_errors.(Server_error (sysprep, [uuid; "VM is not running"]))
+  | exception Vm_sysprep.Sysprep VM_CDR_eject ->
+      raise Api_errors.(Server_error (sysprep, [uuid; "VM failed to eject CD"]))
+  | exception Vm_sysprep.Sysprep VM_CDR_insert ->
+      raise Api_errors.(Server_error (sysprep, [uuid; "VM failed to insert CD"]))
+  | exception Vm_sysprep.Sysprep VM_sysprep_timeout ->
+      raise
+        Api_errors.(
+          Server_error
+            (sysprep, [uuid; "No response from sysprep within allocated time"])
+        )
+  | exception Vm_sysprep.Sysprep XML_too_large ->
+      raise
+        Api_errors.(
+          Server_error (sysprep, [uuid; "unattend.xml file too large"])
+        )
+  | exception Vm_sysprep.Sysprep (Other msg) ->
+      raise Api_errors.(Server_error (sysprep, [uuid; msg]))
+  | exception e ->
+      raise e

@@ -244,7 +244,7 @@ let assert_licensed_storage_motion ~__context =
 
 let rec migrate_with_retries ~__context ~queue_name ~max ~try_no ~dbg:_ ~vm_uuid
     ~xenops_vdi_map ~xenops_vif_map ~xenops_vgpu_map ~xenops_url ~compress
-    ~verify_cert =
+    ~verify_cert ~localhost_migration =
   let open Xapi_xenops_queue in
   let module Client = (val make_client queue_name : XENOPS) in
   let dbg = Context.string_of_task_and_tracing __context in
@@ -254,7 +254,7 @@ let rec migrate_with_retries ~__context ~queue_name ~max ~try_no ~dbg:_ ~vm_uuid
     progress := "Client.VM.migrate" ;
     let t1 =
       Client.VM.migrate dbg vm_uuid xenops_vdi_map xenops_vif_map
-        xenops_vgpu_map xenops_url compress verify_dest
+        xenops_vgpu_map xenops_url compress verify_dest localhost_migration
     in
     progress := "sync_with_task" ;
     ignore (Xapi_xenops.sync_with_task __context queue_name t1)
@@ -281,7 +281,7 @@ let rec migrate_with_retries ~__context ~queue_name ~max ~try_no ~dbg:_ ~vm_uuid
           (Printexc.to_string e) !progress try_no max ;
         migrate_with_retries ~__context ~queue_name ~max ~try_no:(try_no + 1)
           ~dbg ~vm_uuid ~xenops_vdi_map ~xenops_vif_map ~xenops_vgpu_map
-          ~xenops_url ~compress ~verify_cert
+          ~xenops_url ~compress ~verify_cert ~localhost_migration
     (* Something else went wrong *)
     | e ->
         debug
@@ -374,7 +374,8 @@ let pool_migrate ~__context ~vm ~host ~options =
   Pool_features.assert_enabled ~__context ~f:Features.Xen_motion ;
   let dbg = Context.string_of_task __context in
   let localhost = Helpers.get_localhost ~__context in
-  if host = localhost then
+  let localhost_migration = host = localhost in
+  if localhost_migration then
     info "This is a localhost migration" ;
   let open Xapi_xenops_queue in
   let queue_name = queue_of_vm ~__context ~self:vm in
@@ -431,7 +432,7 @@ let pool_migrate ~__context ~vm ~host ~options =
                 let verify_cert = Stunnel_client.pool () in
                 migrate_with_retry ~__context ~queue_name ~dbg ~vm_uuid
                   ~xenops_vdi_map:[] ~xenops_vif_map:[] ~xenops_vgpu_map
-                  ~xenops_url ~compress ~verify_cert ;
+                  ~xenops_url ~compress ~verify_cert ~localhost_migration ;
                 (* Delete all record of this VM locally (including caches) *)
                 Xapi_xenops.Xenopsd_metadata.delete ~__context vm_uuid
             )
@@ -488,6 +489,11 @@ let pool_migrate_complete ~__context ~vm ~host:_ =
     ~value:`restart_device_model ;
   let dbg = Context.string_of_task __context in
   let queue_name = Xapi_xenops_queue.queue_of_vm ~__context ~self:vm in
+  (* Reset the state, which will update allowed operations, clear reservations
+     for halted VMs, disconnect devices *)
+  let power_state = Db.VM.get_power_state ~__context ~self:vm in
+  Xapi_vm_lifecycle.force_state_reset_keep_current_operations ~__context
+    ~self:vm ~value:power_state ;
   if Xapi_xenops.vm_exists_in_xenopsd queue_name dbg id then (
     remove_stale_pcis ~__context ~vm ;
     Xapi_xenops.set_resident_on ~__context ~self:vm ;
@@ -1019,24 +1025,32 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
         (* Though we have no intention of "write", here we use the same mode as the
            associated VBD on a mirrored VDIs (i.e. always RW). This avoids problem
            when we need to start/stop the VM along the migration. *)
-        let read_write = true in
-        (* DP set up is only essential for MIRROR.start/stop due to their open ended pattern.
-           It's not necessary for copy which will take care of that itself. *)
-        ignore
-          (SMAPI.VDI.attach3 dbg new_dp vconf.sr vconf.location vconf.mirror_vm
-             read_write
-          ) ;
-        SMAPI.VDI.activate3 dbg new_dp vconf.sr vconf.location vconf.mirror_vm ;
         let id =
-          Storage_migrate.State.mirror_id_of (vconf.sr, vconf.location)
+          Storage_migrate_helper.State.mirror_id_of (vconf.sr, vconf.location)
         in
-        debug "%s mirror_vm is %s copy_vm is %s" __FUNCTION__
+        let live_vm =
+          match Db.VDI.get_VBDs ~__context ~self:vconf.vdi with
+          | [] ->
+              Storage_migrate_helper.failwith_fmt
+                "VDI %s does not have a corresponding VBD"
+                (Ref.string_of vconf.vdi)
+          | vbd_ref :: _ ->
+              (* XX Is it possible that this VDI might be used as multiple VBDs attached to different VMs? *)
+              let vm_ref = Db.VBD.get_VM ~__context ~self:vbd_ref in
+              let domid =
+                Db.VM.get_domid ~__context ~self:vm_ref |> Int64.to_string
+              in
+              Vm.of_string domid
+        in
+        debug "%s mirror_vm is %s copy_vm is %s live_vm is %s" __FUNCTION__
           (Vm.string_of vconf.mirror_vm)
-          (Vm.string_of vconf.copy_vm) ;
+          (Vm.string_of vconf.copy_vm)
+          (Vm.string_of live_vm) ;
         (* Layering violation!! *)
         ignore (Storage_access.register_mirror __context id) ;
-        SMAPI.DATA.MIRROR.start dbg vconf.sr vconf.location new_dp
-          vconf.mirror_vm vconf.copy_vm remote.sm_url dest_sr is_intra_pool
+        Storage_migrate.start ~dbg ~sr:vconf.sr ~vdi:vconf.location ~dp:new_dp
+          ~mirror_vm:vconf.mirror_vm ~copy_vm:vconf.copy_vm ~live_vm
+          ~url:remote.sm_url ~dest:dest_sr ~verify_dest:is_intra_pool
     in
     let mapfn x =
       let total = Int64.to_float total_size in
@@ -1091,7 +1105,7 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
         | Some mid ->
             ignore (Storage_access.unregister_mirror mid) ;
             let m = SMAPI.DATA.MIRROR.stat dbg mid in
-            (try SMAPI.DATA.MIRROR.stop dbg mid with _ -> ()) ;
+            (try Storage_migrate.stop ~dbg ~id:mid with _ -> ()) ;
             m.Mirror.failed
         | None ->
             false
@@ -1585,7 +1599,8 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~vgpu_map
               let dbg = Context.string_of_task __context in
               migrate_with_retry ~__context ~queue_name ~dbg ~vm_uuid
                 ~xenops_vdi_map ~xenops_vif_map ~xenops_vgpu_map
-                ~xenops_url:remote.xenops_url ~compress ~verify_cert ;
+                ~xenops_url:remote.xenops_url ~compress ~verify_cert
+                ~localhost_migration:is_same_host ;
               Xapi_xenops.Xenopsd_metadata.delete ~__context vm_uuid
           )
         with
@@ -1778,14 +1793,6 @@ let assert_can_migrate ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~options
   let vbds = Db.VM.get_VBDs ~__context ~self:vm in
   let vms_vdis = List.filter_map (vdi_filter __context true) vbds in
   check_vdi_map ~__context vms_vdis vdi_map ;
-  (* Prevent SXM when the VM has a VDI on which changed block tracking is enabled *)
-  List.iter
-    (fun vconf ->
-      let vdi = vconf.vdi in
-      if Db.VDI.get_cbt_enabled ~__context ~self:vdi then
-        raise Api_errors.(Server_error (vdi_cbt_enabled, [Ref.string_of vdi]))
-    )
-    vms_vdis ;
   (* operations required for migration *)
   let required_src_sr_operations = Smint.Feature.[Vdi_snapshot; Vdi_mirror] in
   let required_dst_sr_operations =
@@ -1919,6 +1926,9 @@ let assert_can_migrate ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~options
     )
   ) ;
   (* check_vdi_map above has already verified that all VDIs are in the vdi_map *)
+  (* Previously there was also a check that none of the VDIs have CBT enabled.
+     This is unnecessary, we only need to check that none of the VDIs that
+     *will be moved* have CBT enabled. *)
   assert_can_migrate_vdis ~__context ~vdi_map
 
 let assert_can_migrate_sender ~__context ~vm ~dest ~live:_ ~vdi_map:_ ~vif_map:_

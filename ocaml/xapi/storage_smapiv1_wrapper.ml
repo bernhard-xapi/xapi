@@ -1142,24 +1142,60 @@ functor
           (s_of_vdi vdi) url (s_of_sr dest) ;
         Impl.DATA.copy context ~dbg ~sr ~vdi ~vm ~url ~dest
 
+      let mirror _context ~dbg:_ ~sr:_ ~vdi:_ ~vm:_ ~dest:_ =
+        Storage_interface.unimplemented __FUNCTION__
+
+      let stat _context ~dbg:_ ~sr:_ ~vdi:_ ~vm:_ ~key:_ =
+        Storage_interface.unimplemented __FUNCTION__
+
+      (* tapdisk supports three kind of nbd servers, the old style nbdserver,
+         the new style nbd server and a real nbd server. The old and new style nbd servers
+         are "special" nbd servers that accept fds passed via SCM_RIGHTS and handle
+         connection based on that fd. The real nbd server is a "normal" nbd server
+         that accepts nbd connections from nbd clients, and it does not support fd
+         passing. *)
+      let get_nbd_server_common context ~dbg ~dp ~sr ~vdi ~vm ~style =
+        info "%s DATA.get_nbd_server dbg:%s dp:%s sr:%s vdi:%s vm:%s"
+          __FUNCTION__ dbg dp (s_of_sr sr) (s_of_vdi vdi) (s_of_vm vm) ;
+        let attach_info = DP.attach_info context ~dbg:"nbd" ~sr ~vdi ~dp ~vm in
+        match Storage_smapiv1_migrate.tapdisk_of_attach_info attach_info with
+        | Some tapdev ->
+            let minor = Tapctl.get_minor tapdev in
+            let pid = Tapctl.get_tapdisk_pid tapdev in
+            let path =
+              match style with
+              | `newstyle ->
+                  Printf.sprintf "/var/run/blktap-control/nbdserver-new%d.%d"
+                    pid minor
+              | `oldstyle ->
+                  Printf.sprintf "/var/run/blktap-control/nbdserver%d.%d" pid
+                    minor
+              | `real ->
+                  Printf.sprintf "/var/run/blktap-control/nbd%d.%d" pid minor
+            in
+            debug "%s nbd server path is %s" __FUNCTION__ path ;
+            path
+        | None ->
+            raise
+              (Storage_interface.Storage_error
+                 (Backend_error
+                    (Api_errors.internal_error, ["No tapdisk attach info found"])
+                 )
+              )
+
+      let import_activate context ~dbg ~dp ~sr ~vdi ~vm =
+        get_nbd_server_common context ~dbg ~dp ~sr ~vdi ~vm ~style:`oldstyle
+
+      let get_nbd_server context ~dbg ~dp ~sr ~vdi ~vm =
+        get_nbd_server_common context ~dbg ~dp ~sr ~vdi ~vm ~style:`real
+
       module MIRROR = struct
-        let start context ~dbg ~sr ~vdi ~dp ~mirror_vm ~copy_vm ~url ~dest =
-          info "DATA.MIRROR.start dbg:%s sr:%s vdi:%s url:%s dest:%s" dbg
-            (s_of_sr sr) (s_of_vdi vdi) url (s_of_sr dest) ;
-          Impl.DATA.MIRROR.start context ~dbg ~sr ~vdi ~dp ~mirror_vm ~copy_vm
-            ~url ~dest
+        type context = unit
 
-        let stop context ~dbg ~id =
-          info "DATA.MIRROR.stop dbg:%s id:%s" dbg id ;
-          Impl.DATA.MIRROR.stop context ~dbg ~id
-
-        let list context ~dbg =
-          info "DATA.MIRROR.active dbg:%s" dbg ;
-          Impl.DATA.MIRROR.list context ~dbg
-
-        let stat context ~dbg ~id =
-          info "DATA.MIRROR.stat dbg:%s id:%s" dbg id ;
-          Impl.DATA.MIRROR.stat context ~dbg ~id
+        let send_start _ctx ~dbg:_ ~task_id:_ ~dp:_ ~sr:_ ~vdi:_ ~mirror_vm:_
+            ~mirror_id:_ ~local_vdi:_ ~copy_vm:_ ~live_vm:_ ~url:_
+            ~remote_mirror:_ ~dest_sr:_ ~verify_dest:_ =
+          Storage_interface.unimplemented __FUNCTION__
 
         let receive_start context ~dbg ~sr ~vdi_info ~id ~similar =
           info "DATA.MIRROR.receive_start dbg:%s sr:%s id:%s similar:[%s]" dbg
@@ -1176,6 +1212,11 @@ functor
           Impl.DATA.MIRROR.receive_start2 context ~dbg ~sr ~vdi_info ~id
             ~similar ~vm
 
+        let receive_start3 _context ~dbg:_ ~sr:_ ~vdi_info:_ ~mirror_id:_
+            ~similar:_ ~vm:_ =
+          (* See Storage_smapiv1_migrate.receive_start3 *)
+          Storage_interface.unimplemented __FUNCTION__
+
         let receive_finalize context ~dbg ~id =
           info "DATA.MIRROR.receive_finalize dbg:%s id:%s" dbg id ;
           Impl.DATA.MIRROR.receive_finalize context ~dbg ~id
@@ -1184,54 +1225,28 @@ functor
           info "DATA.MIRROR.receive_finalize2 dbg:%s id:%s" dbg id ;
           Impl.DATA.MIRROR.receive_finalize2 context ~dbg ~id
 
+        let receive_finalize3 _context ~dbg:_ ~mirror_id:_ ~sr:_ ~url:_
+            ~verify_dest:_ =
+          (* see storage_smapiv{1,3}_migrate *)
+          Storage_interface.unimplemented __FUNCTION__
+
         let receive_cancel context ~dbg ~id =
           info "DATA.MIRROR.receive_cancel dbg:%s id:%s" dbg id ;
           Impl.DATA.MIRROR.receive_cancel context ~dbg ~id
 
-        (* tapdisk supports three kind of nbd servers, the old style nbdserver,
-           the new style nbd server and a real nbd server. The old and new style nbd servers
-           are "special" nbd servers that accept fds passed via SCM_RIGHTS and handle
-           connection based on that fd. The real nbd server is a "normal" nbd server
-           that accepts nbd connections from nbd clients, and it does not support fd
-           passing. *)
-        let get_nbd_server_common context ~dbg ~dp ~sr ~vdi ~vm ~style =
-          info "%s DATA.MIRROR.get_nbd_server dbg:%s dp:%s sr:%s vdi:%s vm:%s"
-            __FUNCTION__ dbg dp (s_of_sr sr) (s_of_vdi vdi) (s_of_vm vm) ;
-          let attach_info =
-            DP.attach_info context ~dbg:"nbd" ~sr ~vdi ~dp ~vm
-          in
-          match Storage_migrate.tapdisk_of_attach_info attach_info with
-          | Some tapdev ->
-              let minor = Tapctl.get_minor tapdev in
-              let pid = Tapctl.get_tapdisk_pid tapdev in
-              let path =
-                match style with
-                | `newstyle ->
-                    Printf.sprintf "/var/run/blktap-control/nbdserver-new%d.%d"
-                      pid minor
-                | `oldstyle ->
-                    Printf.sprintf "/var/run/blktap-control/nbdserver%d.%d" pid
-                      minor
-                | `real ->
-                    Printf.sprintf "/var/run/blktap-control/nbd%d.%d" pid minor
-              in
-              debug "%s nbd server path is %s" __FUNCTION__ path ;
-              path
-          | None ->
-              raise
-                (Storage_interface.Storage_error
-                   (Backend_error
-                      ( Api_errors.internal_error
-                      , ["No tapdisk attach info found"]
-                      )
-                   )
-                )
+        let receive_cancel2 _context ~dbg:_ ~mirror_id:_ ~url:_ ~verify_dest:_ =
+          Storage_interface.unimplemented __FUNCTION__
 
-        let import_activate context ~dbg ~dp ~sr ~vdi ~vm =
-          get_nbd_server_common context ~dbg ~dp ~sr ~vdi ~vm ~style:`oldstyle
+        let pre_deactivate_hook _context ~dbg:_ ~dp:_ ~sr:_ ~vdi:_ =
+          Storage_interface.unimplemented __FUNCTION__
 
-        let get_nbd_server context ~dbg ~dp ~sr ~vdi ~vm =
-          get_nbd_server_common context ~dbg ~dp ~sr ~vdi ~vm ~style:`real
+        let has_mirror_failed _context ~dbg:_ ~mirror_id:_ ~sr:_ =
+          Storage_interface.unimplemented __FUNCTION__
+
+        let list _context ~dbg:_ = Storage_interface.unimplemented __FUNCTION__
+
+        let stat _context ~dbg:_ ~id:_ =
+          Storage_interface.unimplemented __FUNCTION__
       end
     end
 

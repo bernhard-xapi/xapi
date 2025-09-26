@@ -17,113 +17,20 @@ module Unixext = Xapi_stdext_unix.Unixext
 module D = Debug.Make (struct let name = "mux" end)
 
 open D
+open Storage_interface
+open Storage_mux_reg
+open Storage_utils
+
+let s_of_sr = Storage_interface.Sr.string_of
+
+let s_of_vdi = Storage_interface.Vdi.string_of
+
+let s_of_vm = Storage_interface.Vm.string_of
+
+let s_of_operation = Storage_interface.Mirror.show_operation
 
 let with_dbg ~name ~dbg f =
   Debug_info.with_dbg ~with_thread:true ~module_name:"SMAPIv2" ~name ~dbg f
-
-type processor = Rpc.call -> Rpc.response
-
-let with_lock = Xapi_stdext_threads.Threadext.Mutex.execute
-
-open Storage_interface
-
-let s_of_sr = Sr.string_of
-
-let s_of_vdi = Vdi.string_of
-
-let s_of_vm = Vm.string_of
-
-type plugin = {
-    processor: processor
-  ; backend_domain: string
-  ; query_result: query_result
-  ; features: Smint.Feature.t list
-}
-
-let plugins : (sr, plugin) Hashtbl.t = Hashtbl.create 10
-
-let m = Mutex.create ()
-
-let debug_printer rpc call =
-  (* debug "Rpc.call = %s" (Xmlrpc.string_of_call call); *)
-  let result = rpc call in
-  (* debug "Rpc.response = %s" (Xmlrpc.string_of_response result); *)
-  result
-
-let register sr rpc d info =
-  with_lock m (fun () ->
-      let features =
-        Smint.Feature.parse_capability_int64 info.Storage_interface.features
-      in
-      Hashtbl.replace plugins sr
-        {
-          processor= debug_printer rpc
-        ; backend_domain= d
-        ; query_result= info
-        ; features
-        } ;
-      debug "register SR %s (currently-registered = [ %s ])" (s_of_sr sr)
-        (String.concat ", "
-           (Hashtbl.fold (fun sr _ acc -> s_of_sr sr :: acc) plugins [])
-        )
-  )
-
-let unregister sr =
-  with_lock m (fun () ->
-      Hashtbl.remove plugins sr ;
-      debug "unregister SR %s (currently-registered = [ %s ])" (s_of_sr sr)
-        (String.concat ", "
-           (Hashtbl.fold (fun sr _ acc -> s_of_sr sr :: acc) plugins [])
-        )
-  )
-
-(* This function is entirely unused, but I am not sure if it should be
-   deleted or not *)
-let query_result_of_sr sr =
-  with_lock m (fun () ->
-      Option.map (fun x -> x.query_result) (Hashtbl.find_opt plugins sr)
-  )
-
-let sr_has_capability sr capability =
-  with_lock m (fun () ->
-      match Hashtbl.find_opt plugins sr with
-      | Some x ->
-          Smint.Feature.has_capability capability x.features
-      | None ->
-          false
-  )
-
-(* This is the policy: *)
-let of_sr sr =
-  with_lock m (fun () ->
-      match Hashtbl.find_opt plugins sr with
-      | Some x ->
-          x.processor
-      | None ->
-          error "No storage plugin for SR: %s (currently-registered = [ %s ])"
-            (s_of_sr sr)
-            (String.concat ", "
-               (Hashtbl.fold (fun sr _ acc -> s_of_sr sr :: acc) plugins [])
-            ) ;
-          raise (Storage_error (No_storage_plugin_for_sr (s_of_sr sr)))
-  )
-
-type 'a sm_result = SMSuccess of 'a | SMFailure of exn
-
-let multicast f =
-  Hashtbl.fold
-    (fun sr plugin acc ->
-      (sr, try SMSuccess (f sr plugin.processor) with e -> SMFailure e) :: acc
-    )
-    plugins []
-
-let success = function SMSuccess _ -> true | _ -> false
-
-let string_of_sm_result f = function
-  | SMSuccess x ->
-      Printf.sprintf "Success: %s" (f x)
-  | SMFailure e ->
-      Printf.sprintf "Failure: %s" (Printexc.to_string e)
 
 let partition l = List.partition (fun (_, x) -> success x) l
 
@@ -146,7 +53,7 @@ module Mux = struct
         List.fold_left
           (fun acc (sr, result) ->
             Printf.sprintf "For SR: %s" (s_of_sr sr)
-            :: string_of_sm_result (fun s -> s) result
+            :: s_of_sm_result (fun s -> s) result
             :: acc
           )
           [] results
@@ -169,6 +76,7 @@ module Mux = struct
       ; features= []
       ; configuration= []
       ; required_cluster_stack= []
+      ; smapi_version= SMAPIv2
       }
 
     let diagnostics () ~dbg =
@@ -425,11 +333,32 @@ module Mux = struct
       Storage_migrate.update_snapshot_info_src ~dbg:(Debug_info.to_string di)
         ~sr ~vdi ~url ~dest ~dest_vdi ~snapshot_pairs
 
+    let set_is_a_snapshot _context ~dbg ~sr ~vdi ~is_a_snapshot =
+      Server_helpers.exec_with_new_task "VDI.set_is_a_snapshot"
+        ~subtask_of:(Ref.of_string dbg) (fun __context ->
+          let vdi, _ = find_vdi ~__context sr vdi in
+          Db.VDI.set_is_a_snapshot ~__context ~self:vdi ~value:is_a_snapshot
+      )
+
+    let set_snapshot_time _context ~dbg ~sr ~vdi ~snapshot_time =
+      let module Date = Clock.Date in
+      Server_helpers.exec_with_new_task "VDI.set_snapshot_time"
+        ~subtask_of:(Ref.of_string dbg) (fun __context ->
+          let vdi, _ = find_vdi ~__context sr vdi in
+          let snapshot_time = Date.of_iso8601 snapshot_time in
+          Db.VDI.set_snapshot_time ~__context ~self:vdi ~value:snapshot_time
+      )
+
+    let set_snapshot_of _context ~dbg ~sr ~vdi ~snapshot_of =
+      Server_helpers.exec_with_new_task "VDI.set_snapshot_of"
+        ~subtask_of:(Ref.of_string dbg) (fun __context ->
+          let vdi, _ = find_vdi ~__context sr vdi in
+          let snapshot_of, _ = find_vdi ~__context sr snapshot_of in
+          Db.VDI.set_snapshot_of ~__context ~self:vdi ~value:snapshot_of
+      )
+
     let update_snapshot_info_dest () ~dbg ~sr ~vdi ~src_vdi ~snapshot_pairs =
-      with_dbg ~name:"SR.update_snapshot_info_dest" ~dbg @@ fun di ->
-      let module C = StorageAPI (Idl.Exn.GenClient (struct
-        let rpc = of_sr sr
-      end)) in
+      with_dbg ~name:"SR.update_snapshot_info_dest" ~dbg @@ fun _di ->
       info
         "SR.update_snapshot_info_dest dbg:%s sr:%s vdi:%s ~src_vdi:%s \
          snapshot_pairs:%s"
@@ -443,8 +372,44 @@ module Mux = struct
         |> String.concat "; "
         |> Printf.sprintf "[%s]"
         ) ;
-      C.SR.update_snapshot_info_dest (Debug_info.to_string di) sr vdi src_vdi
-        snapshot_pairs
+      Server_helpers.exec_with_new_task "SR.update_snapshot_info_dest"
+        ~subtask_of:(Ref.of_string dbg) (fun __context ->
+          let local_vdis, _ = scan2 () ~dbg ~sr in
+          let find_sm_vdi ~vdi ~vdi_info_list =
+            try List.find (fun x -> x.vdi = vdi) vdi_info_list
+            with Not_found ->
+              raise (Storage_error (Vdi_does_not_exist (s_of_vdi vdi)))
+          in
+          let assert_content_ids_match ~vdi_info1 ~vdi_info2 =
+            if vdi_info1.content_id <> vdi_info2.content_id then
+              raise
+                (Storage_error
+                   (Content_ids_do_not_match
+                      (s_of_vdi vdi_info1.vdi, s_of_vdi vdi_info2.vdi)
+                   )
+                )
+          in
+          (* For each (local snapshot vdi, source snapshot vdi) pair:
+             					 * - Check that the content_ids are the same
+             					 * - Copy snapshot_time from the source VDI to the local VDI
+             					 * - Set the local VDI's snapshot_of to vdi
+             					 * - Set is_a_snapshot = true for the local snapshot *)
+          List.iter
+            (fun (local_snapshot, src_snapshot_info) ->
+              let local_snapshot_info =
+                find_sm_vdi ~vdi:local_snapshot ~vdi_info_list:local_vdis
+              in
+              assert_content_ids_match ~vdi_info1:local_snapshot_info
+                ~vdi_info2:src_snapshot_info ;
+              set_snapshot_time __context ~dbg ~sr ~vdi:local_snapshot
+                ~snapshot_time:src_snapshot_info.snapshot_time ;
+              set_snapshot_of __context ~dbg ~sr ~vdi:local_snapshot
+                ~snapshot_of:vdi ;
+              set_is_a_snapshot __context ~dbg ~sr ~vdi:local_snapshot
+                ~is_a_snapshot:true
+            )
+            snapshot_pairs
+      )
   end
 
   module VDI = struct
@@ -679,10 +644,23 @@ module Mux = struct
       with_dbg ~name:"VDI.deativate" ~dbg @@ fun di ->
       info "VDI.deactivate dbg:%s dp:%s sr:%s vdi:%s vm:%s" dbg dp (s_of_sr sr)
         (s_of_vdi vdi) (s_of_vm vm) ;
-      let module C = StorageAPI (Idl.Exn.GenClient (struct
-        let rpc = of_sr sr
-      end)) in
-      C.VDI.deactivate (Debug_info.to_string di) dp sr vdi vm
+      let open DP_info in
+      match read dp with
+      | Some {sr; vdi; vm; _} ->
+          let module C = StorageAPI (Idl.Exn.GenClient (struct
+            let rpc = of_sr sr
+          end)) in
+          C.VDI.deactivate (Debug_info.to_string di) dp sr vdi vm ;
+          (*XX The hook should not be called here, nor should storage_mux care about
+            the SMAPI version of the SR, but as xapi-storage-script cannot call code
+            xapi, and smapiv1_wrapper has state tracking logic, the hook has to be placed
+            here for now. *)
+          if smapi_version_of_sr sr = SMAPIv3 then
+            Storage_migrate.post_deactivate_hook ~sr ~vdi ~dp
+      | None ->
+          info
+            "dp %s is not associated with a locally attached VDI; nothing to do"
+            dp
 
     let detach () ~dbg ~dp ~sr ~vdi ~vm =
       with_dbg ~name:"VDI.detach" ~dbg @@ fun di ->
@@ -834,22 +812,108 @@ module Mux = struct
     let copy () ~dbg =
       with_dbg ~name:"DATA.copy" ~dbg @@ fun dbg -> Storage_migrate.copy ~dbg
 
-    module MIRROR = struct
-      let start () ~dbg ~sr ~vdi ~dp ~mirror_vm ~copy_vm ~url ~dest ~verify_dest
-          =
-        with_dbg ~name:"DATA.MIRROR.start" ~dbg @@ fun di ->
-        info
-          "%s dbg:%s sr: %s vdi: %s dp:%s mirror_vm: %s copy_vm: %s url: %s \
-           dest sr: %s verify_dest: %B"
-          __FUNCTION__ dbg (s_of_sr sr) (s_of_vdi vdi) dp (s_of_vm mirror_vm)
-          (s_of_vm copy_vm) url (s_of_sr dest) verify_dest ;
-        Storage_migrate.start ~dbg:di ~sr ~vdi ~dp ~mirror_vm ~copy_vm ~url
-          ~dest ~verify_dest
+    let mirror () ~dbg ~sr ~vdi ~vm ~dest =
+      with_dbg ~name:"DATA.mirror" ~dbg @@ fun di ->
+      info "%s dbg:%s sr: %s vdi: %s vm:%s  remote:%s" __FUNCTION__ dbg
+        (s_of_sr sr) (s_of_vdi vdi) (s_of_vm vm) dest ;
+      let module C = StorageAPI (Idl.Exn.GenClient (struct
+        let rpc = of_sr sr
+      end)) in
+      C.DATA.mirror (Debug_info.to_string di) sr vdi vm dest
 
-      let stop () ~dbg ~id =
-        with_dbg ~name:"DATA.MIRROR.stop" ~dbg @@ fun di ->
-        info "%s dbg:%s mirror_id: %s" __FUNCTION__ dbg id ;
-        Storage_migrate.stop ~dbg:di.log ~id
+    let stat () ~dbg ~sr ~vdi ~vm ~key =
+      with_dbg ~name:"DATA.stat" ~dbg @@ fun di ->
+      info "%s dbg:%s sr: %s vdi: %s vm: %s opeartion_key: %s" __FUNCTION__ dbg
+        (s_of_sr sr) (s_of_vdi vdi) (s_of_vm vm) (s_of_operation key) ;
+      let module C = StorageAPI (Idl.Exn.GenClient (struct
+        let rpc = of_sr sr
+      end)) in
+      C.DATA.stat (Debug_info.to_string di) sr vdi vm key
+
+    let import_activate () ~dbg ~dp ~sr ~vdi ~vm =
+      with_dbg ~name:"DATA.import_activate" ~dbg @@ fun di ->
+      info "%s dbg:%s dp:%s sr:%s vdi:%s vm:%s" __FUNCTION__ dbg dp (s_of_sr sr)
+        (s_of_vdi vdi) (s_of_vm vm) ;
+      let module C = StorageAPI (Idl.Exn.GenClient (struct
+        let rpc = of_sr sr
+      end)) in
+      C.DATA.import_activate (Debug_info.to_string di) dp sr vdi vm
+
+    let get_nbd_server () ~dbg ~dp ~sr ~vdi ~vm =
+      with_dbg ~name:"DATA.get_nbd_server" ~dbg @@ fun di ->
+      info "%s dbg:%s dp:%s sr:%s vdi:%s vm:%s" __FUNCTION__ dbg dp (s_of_sr sr)
+        (s_of_vdi vdi) (s_of_vm vm) ;
+      let module C = StorageAPI (Idl.Exn.GenClient (struct
+        let rpc = of_sr sr
+      end)) in
+      C.DATA.get_nbd_server (Debug_info.to_string di) dp sr vdi vm
+
+    module MIRROR = struct
+      type context = unit
+
+      let send_start _ctx ~dbg:_ ~task_id:_ ~dp:_ ~sr:_ ~vdi:_ ~mirror_vm:_
+          ~mirror_id:_ ~local_vdi:_ ~copy_vm:_ ~live_vm:_ ~url:_
+          ~remote_mirror:_ ~dest_sr:_ ~verify_dest:_ =
+        Storage_interface.unimplemented
+          __FUNCTION__ (* see storage_smapi{v1,v3}_migrate.ml *)
+
+      let receive_start () ~dbg ~sr ~vdi_info ~id ~similar =
+        with_dbg ~name:"DATA.MIRROR.receive_start" ~dbg @@ fun _di ->
+        info "%s dbg: %s sr: %s vdi_info: %s mirror_id: %s similar: %s"
+          __FUNCTION__ dbg (s_of_sr sr)
+          (string_of_vdi_info vdi_info)
+          id
+          (String.concat ";" similar) ;
+        (* This goes straight to storage_smapiv1_migrate for backwards compatability
+           reasons, new code should not call receive_start any more *)
+        Storage_smapiv1_migrate.MIRROR.receive_start () ~dbg ~sr ~vdi_info ~id
+          ~similar
+
+      let receive_start2 () ~dbg ~sr ~vdi_info ~id ~similar ~vm =
+        with_dbg ~name:"DATA.MIRROR.receive_start2" ~dbg @@ fun _di ->
+        info "%s dbg: %s sr: %s vdi_info: %s mirror_id: %s similar: %s vm: %s"
+          __FUNCTION__ dbg (s_of_sr sr)
+          (string_of_vdi_info vdi_info)
+          id
+          (String.concat ";" similar)
+          (s_of_vm vm) ;
+        info "%s dbg:%s" __FUNCTION__ dbg ;
+        (* This goes straight to storage_smapiv1_migrate for backwards compatability
+           reasons, new code should not call receive_start any more *)
+        Storage_smapiv1_migrate.MIRROR.receive_start2 () ~dbg ~sr ~vdi_info ~id
+          ~similar ~vm
+
+      (** see storage_smapiv{1,3}_migrate.receive_start3 *)
+      let receive_start3 () ~dbg:_ ~sr:_ ~vdi_info:_ ~mirror_id:_ ~similar:_
+          ~vm:_ =
+        Storage_interface.unimplemented __FUNCTION__
+
+      let receive_finalize () ~dbg ~id =
+        with_dbg ~name:"DATA.MIRROR.receive_finalize" ~dbg @@ fun di ->
+        info "%s dbg: %s mirror_id: %s" __FUNCTION__ dbg id ;
+        Storage_smapiv1_migrate.MIRROR.receive_finalize () ~dbg:di.log ~id
+
+      let receive_finalize2 () ~dbg ~id =
+        with_dbg ~name:"DATA.MIRROR.receive_finalize2" ~dbg @@ fun di ->
+        info "%s dbg: %s mirror_id: %s" __FUNCTION__ dbg id ;
+        Storage_smapiv1_migrate.MIRROR.receive_finalize2 () ~dbg:di.log ~id
+
+      let receive_finalize3 () ~dbg:_ ~mirror_id:_ ~sr:_ ~url:_ ~verify_dest:_ =
+        Storage_interface.unimplemented __FUNCTION__
+
+      let receive_cancel () ~dbg ~id =
+        with_dbg ~name:"DATA.MIRROR.receive_cancel" ~dbg @@ fun di ->
+        info "%s dbg: %s mirror_id: %s" __FUNCTION__ dbg id ;
+        Storage_smapiv1_migrate.MIRROR.receive_cancel () ~dbg:di.log ~id
+
+      let receive_cancel2 () ~dbg:_ ~mirror_id:_ ~url:_ ~verify_dest:_ =
+        Storage_interface.unimplemented __FUNCTION__
+
+      let pre_deactivate_hook _ctx ~dbg:_ ~dp:_ ~sr:_ ~vdi:_ =
+        Storage_interface.unimplemented __FUNCTION__
+
+      let has_mirror_failed _ctx ~dbg:_ ~mirror_id:_ ~sr:_ =
+        Storage_interface.unimplemented __FUNCTION__
 
       let list () ~dbg =
         with_dbg ~name:"DATA.MIRROR.list" ~dbg @@ fun di ->
@@ -860,60 +924,6 @@ module Mux = struct
         with_dbg ~name:"DATA.MIRROR.stat" ~dbg @@ fun di ->
         info "%s dbg: %s mirror_id: %s" __FUNCTION__ di.log id ;
         Storage_migrate.stat ~dbg:di.log ~id
-
-      let receive_start () ~dbg ~sr ~vdi_info ~id ~similar =
-        with_dbg ~name:"DATA.MIRROR.receive_start" ~dbg @@ fun di ->
-        info "%s dbg: %s sr: %s vdi_info: %s mirror_id: %s similar: %s"
-          __FUNCTION__ dbg (s_of_sr sr)
-          (string_of_vdi_info vdi_info)
-          id
-          (String.concat ";" similar) ;
-        Storage_migrate.receive_start ~dbg:di.log ~sr ~vdi_info ~id ~similar
-
-      let receive_start2 () ~dbg ~sr ~vdi_info ~id ~similar ~vm =
-        with_dbg ~name:"DATA.MIRROR.receive_start2" ~dbg @@ fun di ->
-        info "%s dbg: %s sr: %s vdi_info: %s mirror_id: %s similar: %s vm: %s"
-          __FUNCTION__ dbg (s_of_sr sr)
-          (string_of_vdi_info vdi_info)
-          id
-          (String.concat ";" similar)
-          (s_of_vm vm) ;
-        info "%s dbg:%s" __FUNCTION__ dbg ;
-        Storage_migrate.receive_start2 ~dbg:di.log ~sr ~vdi_info ~id ~similar
-          ~vm
-
-      let receive_finalize () ~dbg ~id =
-        with_dbg ~name:"DATA.MIRROR.receive_finalize" ~dbg @@ fun di ->
-        info "%s dbg: %s mirror_id: %s" __FUNCTION__ dbg id ;
-        Storage_migrate.receive_finalize ~dbg:di.log ~id
-
-      let receive_finalize2 () ~dbg ~id =
-        with_dbg ~name:"DATA.MIRROR.receive_finalize2" ~dbg @@ fun di ->
-        info "%s dbg: %s mirror_id: %s" __FUNCTION__ dbg id ;
-        Storage_migrate.receive_finalize2 ~dbg:di.log ~id
-
-      let receive_cancel () ~dbg ~id =
-        with_dbg ~name:"DATA.MIRROR.receive_cancel" ~dbg @@ fun di ->
-        info "%s dbg: %s mirror_id: %s" __FUNCTION__ dbg id ;
-        Storage_migrate.receive_cancel ~dbg:di.log ~id
-
-      let import_activate () ~dbg ~dp ~sr ~vdi ~vm =
-        with_dbg ~name:"DATA.MIRROR.import_activate" ~dbg @@ fun di ->
-        info "%s dbg:%s dp:%s sr:%s vdi:%s vm:%s" __FUNCTION__ dbg dp
-          (s_of_sr sr) (s_of_vdi vdi) (s_of_vm vm) ;
-        let module C = StorageAPI (Idl.Exn.GenClient (struct
-          let rpc = of_sr sr
-        end)) in
-        C.DATA.MIRROR.import_activate (Debug_info.to_string di) dp sr vdi vm
-
-      let get_nbd_server () ~dbg ~dp ~sr ~vdi ~vm =
-        with_dbg ~name:"DATA.MIRROR.get_nbd_server" ~dbg @@ fun di ->
-        info "%s dbg:%s dp:%s sr:%s vdi:%s vm:%s" __FUNCTION__ dbg dp
-          (s_of_sr sr) (s_of_vdi vdi) (s_of_vm vm) ;
-        let module C = StorageAPI (Idl.Exn.GenClient (struct
-          let rpc = of_sr sr
-        end)) in
-        C.DATA.MIRROR.get_nbd_server (Debug_info.to_string di) dp sr vdi vm
     end
   end
 

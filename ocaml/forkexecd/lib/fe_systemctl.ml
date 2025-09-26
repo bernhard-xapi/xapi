@@ -107,10 +107,10 @@ let show ~service =
 let stop ~service =
   action ~service "stop" ;
   (* Stopping shouldn't fail because it should fall back to SIGKILL which should almost always work,
-   * unless there is a kernel bug that keeps a process stuck.
-   * In the unlikely scenario that this does fail we leave the transient service file behind
-   * so that the failure can be investigated.
-   * *)
+     unless there is a kernel bug that keeps a process stuck.
+     In the unlikely scenario that this does fail we leave the transient service file behind
+     so that the failure can be investigated.
+  *)
   let status = show ~service in
   (* allow systemd to garbage-collect the status and the unit, preventing leaks.
    * See CollectMode in systemd.unit(5) for details. *)
@@ -121,14 +121,18 @@ let stop ~service =
   Xapi_stdext_unix.Unixext.unlink_safe destination ;
   status
 
-let is_active ~service =
+let status ~command ~service =
   let status =
     Forkhelpers.safe_close_and_exec None None None [] systemctl
-      ["is-active"; "--quiet"; service]
+      [command; "--quiet"; service]
     |> Forkhelpers.waitpid
     |> snd
   in
   Unix.WEXITED 0 = status
+
+let is_active ~service = status ~command:"is-active" ~service
+
+let is_enabled ~service = status ~command:"is-enabled" ~service
 
 (** path to service file *)
 let path service = Filename.concat run_path (service ^ ".service")
@@ -158,7 +162,7 @@ let start_transient ?env ?properties ?(exec_ty = Type.Simple) ~service cmd args
     (* If start failed we do not know what state the service is in:
      * try to stop it and clean up.
      * Stopping could fail as well, in which case report the original exception.
-     * *)
+     *)
     ( try
         let (_ : status) = stop ~service in
         ()

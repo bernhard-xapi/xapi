@@ -2098,6 +2098,19 @@ let call_plugin =
     ~result:(String, "Result from the plugin")
     ~allowed_roles:_R_VM_OP ()
 
+let call_host_plugin =
+  call ~name:"call_host_plugin"
+    ~doc:"Call an API plugin on the host where this vm resides" ~lifecycle:[]
+    ~params:
+      [
+        (Ref _vm, "vm", "The vm")
+      ; (String, "plugin", "The name of the plugin")
+      ; (String, "fn", "The name of the function within the plugin")
+      ; (Map (String, String), "args", "Arguments for the function")
+      ]
+    ~result:(String, "Result from the plugin")
+    ~allowed_roles:_R_VM_OP ()
+
 let set_has_vendor_device =
   call ~name:"set_has_vendor_device"
     ~lifecycle:
@@ -2198,6 +2211,7 @@ let operations =
         ; ("reverting", "Reverting the VM to a previous snapshotted state")
         ; ("destroy", "refers to the act of uninstalling the VM")
         ; ("create_vtpm", "Creating and adding a VTPM to this VM")
+        ; ("sysprep", "Performing a Windows sysprep on this VM")
         ]
     )
 
@@ -2355,6 +2369,19 @@ let restart_device_models =
       ]
     ~allowed_roles:(_R_VM_POWER_ADMIN ++ _R_CLIENT_CERT)
     ()
+
+let sysprep =
+  call ~name:"sysprep" ~lifecycle:[]
+    ~params:
+      [
+        (Ref _vm, "self", "The VM")
+      ; (SecretString, "unattend", "XML content passed to sysprep")
+      ; (Float, "timeout", "timeout in seconds for expected reboot")
+      ]
+    ~doc:
+      "Pass unattend.xml to Windows sysprep and wait for the VM to shut down \
+       as part of a reboot."
+    ~allowed_roles:_R_VM_ADMIN ()
 
 let vm_uefi_mode =
   Enum
@@ -2545,6 +2572,7 @@ let t =
       ; set_groups
       ; query_services
       ; call_plugin
+      ; call_host_plugin
       ; set_has_vendor_device
       ; import
       ; set_actions_after_crash
@@ -2557,6 +2585,7 @@ let t =
       ; set_blocked_operations
       ; add_to_blocked_operations
       ; remove_from_blocked_operations
+      ; sysprep
       ]
     ~contents:
       ([
@@ -2591,7 +2620,7 @@ let t =
                 )
               ]
             "Creators of VMs and templates may store version information here."
-        ; field ~effect:true ~ty:Bool "is_a_template"
+        ; field ~has_effect:true ~ty:Bool "is_a_template"
             ~lifecycle:
               [
                 ( Published
@@ -2786,7 +2815,7 @@ let t =
             ~ty:String "recommendations"
             "An XML specification of recommended values and ranges for \
              properties of this VM"
-        ; field ~effect:true ~in_oss_since:None
+        ; field ~has_effect:true ~in_oss_since:None
             ~ty:(Map (String, String))
             ~lifecycle:
               [

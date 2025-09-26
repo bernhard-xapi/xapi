@@ -219,6 +219,27 @@ let test_parse_wbinfo_uid_info =
           ; gecos= {|ladmin|}
           }
       )
+      (* XSI-1901: output of customer environment, has `:` in the gecos,
+         other fields does not likely contain it *)
+    ; ( {|HVS\udaadmin:*:3000000:3000000:ADMIN: Dalsem, Ulric:/home/HVS/udaadmin:/bin/bash|}
+      , Ok
+          {
+            user_name= {|HVS\udaadmin|}
+          ; uid= 3000000
+          ; gid= 3000000
+          ; gecos= {|ADMIN: Dalsem, Ulric|}
+          }
+      )
+      (* Multiple `:` in gecos *)
+    ; ( {|HVS\udaadmin:*:3000000:3000000:ADMIN: Dalsem, Ulric, POOL OP: udaadmin:/home/HVS/udaadmin:/bin/bash|}
+      , Ok
+          {
+            user_name= {|HVS\udaadmin|}
+          ; uid= 3000000
+          ; gid= 3000000
+          ; gecos= {|ADMIN: Dalsem, Ulric, POOL OP: udaadmin|}
+          }
+      )
     ; ( {|CONNAPP\locked:*:3000004:3000174::/home/CONNAPP/locked:/bin/bash|}
       , Ok
           {user_name= {|CONNAPP\locked|}; uid= 3000004; gid= 3000174; gecos= ""}
@@ -499,6 +520,106 @@ let test_wbinfo_exception_of_stderr =
   in
   matrix |> List.map @@ fun (inp, exp) -> ("<omit inp>", `Quick, check inp exp)
 
+let test_add_ipv4_localhost_to_hosts =
+  let open Extauth_plugin_ADwinbind in
+  let check inp exp () =
+    let msg =
+      Printf.sprintf "%s -> %s" (String.concat "\n" inp) (String.concat "\n" exp)
+    in
+    let actual =
+      HostsConfIPv4.join ~name:"hostname" ~domain:"domain" ~lines:inp
+    in
+    Alcotest.(check @@ list string) msg exp actual
+  in
+  let matrix =
+    [
+      ( [
+          "127.0.0.1   localhost localhost.localdomain localhost4 \
+           localhost4.localdomain4"
+        ]
+      , [
+          "127.0.0.1   hostname.domain hostname localhost \
+           localhost.localdomain localhost4 localhost4.localdomain4"
+        ]
+      )
+    ; ( ["127.0.0.1   localhost hostname hostname.domain localhost.localdomain"]
+      , ["127.0.0.1   hostname.domain hostname localhost localhost.localdomain"]
+      )
+    ; ( ["192.168.0.1   some_host"]
+      , ["127.0.0.1 hostname.domain hostname"; "192.168.0.1   some_host"]
+      )
+    ; ([], ["127.0.0.1 hostname.domain hostname"])
+    ]
+  in
+  matrix |> List.map @@ fun (inp, exp) -> ("<omit inp>", `Quick, check inp exp)
+
+let test_add_ipv4_and_ipv6_localhost_to_hosts =
+  let open Extauth_plugin_ADwinbind in
+  let check inp exp () =
+    let msg =
+      Printf.sprintf "%s -> %s" (String.concat "\n" inp) (String.concat "\n" exp)
+    in
+    let actual =
+      HostsConfIPv6.join ~name:"hostname" ~domain:"domain" ~lines:inp
+      |> fun lines ->
+      HostsConfIPv4.join ~name:"hostname" ~domain:"domain" ~lines
+    in
+    Alcotest.(check @@ list string) msg exp actual
+  in
+  let matrix =
+    [
+      ( ["127.0.0.1   localhost"]
+      , [
+          "::1 hostname.domain hostname"
+        ; "127.0.0.1   hostname.domain hostname localhost"
+        ]
+      )
+    ; ( ["127.0.0.1   localhost"; "::1 localhost"]
+      , [
+          "127.0.0.1   hostname.domain hostname localhost"
+        ; "::1 hostname.domain hostname localhost"
+        ]
+      )
+    ; ( []
+      , ["127.0.0.1 hostname.domain hostname"; "::1 hostname.domain hostname"]
+      )
+    ]
+  in
+  matrix |> List.map @@ fun (inp, exp) -> ("<omit inp>", `Quick, check inp exp)
+
+let test_remove_ipv4_localhost_from_hosts =
+  let open Extauth_plugin_ADwinbind in
+  let check inp exp () =
+    let msg =
+      Printf.sprintf "%s -> %s" (String.concat "\n" inp) (String.concat "\n" exp)
+    in
+    let actual =
+      HostsConfIPv4.leave ~name:"hostname" ~domain:"domain" ~lines:inp
+    in
+    Alcotest.(check @@ list string) msg exp actual
+  in
+  let matrix =
+    [
+      ( [
+          "127.0.0.1   localhost localhost.localdomain localhost4 \
+           localhost4.localdomain4"
+        ]
+      , [
+          "127.0.0.1   localhost localhost.localdomain localhost4 \
+           localhost4.localdomain4"
+        ]
+      )
+    ; ( ["127.0.0.1   localhost hostname hostname.domain localhost.localdomain"]
+      , ["127.0.0.1   localhost localhost.localdomain"]
+      )
+    ; (["127.0.0.1   hostname hostname.domain"], [])
+    ; ( ["192.168.0.1   some_host"; "127.0.0.1   localhost hostname"]
+      , ["192.168.0.1   some_host"; "127.0.0.1   localhost"]
+      )
+    ]
+  in
+  matrix |> List.map @@ fun (inp, exp) -> ("<omit inp>", `Quick, check inp exp)
+
 let tests =
   [
     ("ADwinbind:extract_ou_config", ExtractOuConfig.tests)
@@ -511,5 +632,14 @@ let tests =
   ; ("ADwinbind:test_parse_ldap_stdout", test_parse_ldap_stdout)
   ; ( "ADwinbind:test_wbinfo_exception_of_stderr"
     , test_wbinfo_exception_of_stderr
+    )
+  ; ( "ADwinbind:test_add_ipv4_localhost_to_hosts"
+    , test_add_ipv4_localhost_to_hosts
+    )
+  ; ( "ADwinbind:test_remove_ipv4_localhost_from_hosts"
+    , test_remove_ipv4_localhost_from_hosts
+    )
+  ; ( "ADwinbind:test_add_ipv4_and_ipv6_localhost_to_hosts"
+    , test_add_ipv4_and_ipv6_localhost_to_hosts
     )
   ]

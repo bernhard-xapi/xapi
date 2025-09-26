@@ -109,10 +109,15 @@ exception Message_switch_failure
 (** Synchronise the SM table with the SMAPIv1 plugins on the disk and the SMAPIv2
     plugins mentioned in the configuration file whitelist. *)
 let on_xapi_start ~__context =
+  (* An SM is either implemented as a plugin - for which we check its
+      presence, or via an API *)
+  let is_available rc =
+    Sys.file_exists rc.API.sM_driver_filename
+    || Version.String.ge rc.sM_required_api_version "5.0"
+  in
   let existing =
-    List.map
-      (fun (rf, rc) -> (rc.API.sM_type, (rf, rc)))
-      (Db.SM.get_all_records ~__context)
+    Db.SM.get_all_records ~__context
+    |> List.map (fun (rf, rc) -> (rc.API.sM_type, (rf, rc)))
   in
   let explicitly_configured_drivers =
     List.filter_map
@@ -156,6 +161,7 @@ let on_xapi_start ~__context =
       | Message_switch_failure ->
           [] (* no more logging *)
       | e ->
+          Backtrace.is_important e ;
           error "Unexpected error querying the message switch: %s"
             (Printexc.to_string e) ;
           Debug.log_backtrace e (Backtrace.get e) ;
@@ -165,6 +171,9 @@ let on_xapi_start ~__context =
   in
   (* Add all the running SMAPIv2 drivers *)
   let to_keep = to_keep @ running_smapiv2_drivers in
+  let unavailable =
+    List.filter (fun (_, (_, rc)) -> not (is_available rc)) existing
+  in
   (* Delete all records which aren't configured or in-use *)
   List.iter
     (fun ty ->
@@ -175,6 +184,13 @@ let on_xapi_start ~__context =
       try Db.SM.destroy ~__context ~self with _ -> ()
     )
     (Listext.List.set_difference (List.map fst existing) to_keep) ;
+  List.iter
+    (fun (name, (self, rc)) ->
+      info "%s: unregistering SM plugin %s (%s) since it is unavailable"
+        __FUNCTION__ name rc.API.sM_uuid ;
+      try Db.SM.destroy ~__context ~self with _ -> ()
+    )
+    unavailable ;
 
   (* Synchronize SMAPIv1 plugins *)
 
@@ -264,7 +280,9 @@ let bind ~__context ~pbd =
     let service = make_service uuid ty in
     System_domains.register_service service queue_name ;
     let info = Client.Query.query dbg in
-    Storage_mux.register (Storage_interface.Sr.of_string sr_uuid) rpc uuid info ;
+    Storage_mux_reg.register
+      (Storage_interface.Sr.of_string sr_uuid)
+      rpc uuid info ;
     info
   with e ->
     error
@@ -281,7 +299,7 @@ let unbind ~__context ~pbd =
   let ty = Db.SR.get_type ~__context ~self:sr in
   let sr = Db.SR.get_uuid ~__context ~self:sr in
   info "SR %s will nolonger be implemented by VM %s" sr (Ref.string_of driver) ;
-  Storage_mux.unregister (Storage_interface.Sr.of_string sr) ;
+  Storage_mux_reg.unregister (Storage_interface.Sr.of_string sr) ;
   let service = make_service uuid ty in
   System_domains.unregister_service service
 

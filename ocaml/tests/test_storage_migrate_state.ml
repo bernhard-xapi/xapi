@@ -17,11 +17,11 @@ open Test_highlevel
 module StorageMigrateState = struct
   type state_t = unit
 
-  let create_default_state () = Storage_migrate.State.clear ()
+  let create_default_state () = Storage_migrate_helper.State.clear ()
 end
 
 let sample_send_state =
-  Storage_migrate.State.Send_state.
+  Storage_migrate_helper.State.Send_state.
     {
       url= "url"
     ; dest_sr= Storage_interface.Sr.of_string "dest_sr"
@@ -41,11 +41,14 @@ let sample_send_state =
           )
     ; failed= false
     ; watchdog= None
+    ; live_vm= Storage_interface.Vm.of_string "0"
+    ; mirror_key= None
+    ; vdi= Storage_interface.Vdi.of_string ""
     }
 
 let sample_receive_state =
   let open Storage_interface in
-  Storage_migrate.State.Receive_state.
+  Storage_migrate_helper.State.Receive_state.
     {
       sr= Sr.of_string "my_sr"
     ; dummy_vdi= Vdi.of_string "dummy_vdi"
@@ -54,10 +57,12 @@ let sample_receive_state =
     ; parent_vdi= Vdi.of_string "parent_vdi"
     ; remote_vdi= Vdi.of_string "remote_vdi"
     ; mirror_vm= Vm.of_string "mirror_vm"
+    ; url= ""
+    ; verify_dest= false
     }
 
 let sample_copy_state =
-  Storage_migrate.State.Copy_state.
+  Storage_migrate_helper.State.Copy_state.
     {
       base_dp= "base_dp"
     ; leaf_dp= "leaf_dp"
@@ -70,7 +75,7 @@ let sample_copy_state =
 
 module MapOf = Generic.MakeStateful (struct
   module Io = struct
-    open Storage_migrate.State
+    open Storage_migrate_helper.State
 
     type input_t =
       (string * osend operation) option
@@ -88,7 +93,7 @@ module MapOf = Generic.MakeStateful (struct
   end
 
   module State = StorageMigrateState
-  open Storage_migrate.State
+  open Storage_migrate_helper.State
 
   let load_input () (send, recv, copy) =
     Option.iter (fun (id, send) -> add id send) send ;
@@ -116,7 +121,7 @@ module MapOf = Generic.MakeStateful (struct
 end)
 
 let test_clear () =
-  let open Storage_migrate.State in
+  let open Storage_migrate_helper.State in
   clear () ;
   add "foo" (Send_op sample_send_state) ;
   add "bar" (Recv_op sample_receive_state) ;
@@ -130,5 +135,5 @@ let test_clear () =
 let test = [("clear", `Quick, test_clear)]
 
 let tests =
-  Storage_migrate.State.persist_root := Test_common.working_area ;
+  Storage_migrate_helper.State.persist_root := Test_common.working_area ;
   [("storage_migrate_state_map_of", MapOf.tests)]

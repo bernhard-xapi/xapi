@@ -338,7 +338,7 @@ let assert_cluster_host_quorate ~__context ~self =
    * achieved quorum yet if we have just booted and haven't seen enough hosts.
    * Do this via an API call rather than reading a field in the database, because the field in the
    * database could be out of date.
-   * *)
+   *)
   let result =
     Cluster_client.LocalClient.diagnostics (rpc ~__context)
       "assert_cluster_host_quorate"
@@ -516,6 +516,8 @@ module Watcher = struct
         Db.Cluster.set_quorum ~__context ~self:cluster
           ~value:(Int64.of_int diag.quorum) ;
         Db.Cluster.set_live_hosts ~__context ~self:cluster
+          ~value:(Int64.of_int diag.total_votes) ;
+        Db.Cluster.set_expected_hosts ~__context ~self:cluster
           ~value:(Int64.of_int diag.total_votes)
     | Error (InternalError message) | Error (Unix_error message) ->
         warn "%s Cannot query diagnostics due to %s, not performing update"

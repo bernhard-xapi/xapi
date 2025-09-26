@@ -147,33 +147,34 @@ install-extra:
 	DESTDIR=$(DESTDIR) SBINDIR=$(SBINDIR) QEMU_WRAPPER_DIR=$(QEMU_WRAPPER_DIR) XENOPSD_LIBEXECDIR=$(XENOPSD_LIBEXECDIR) ETCDIR=$(ETCDIR) ./ocaml/xenopsd/scripts/make-custom-xenopsd.conf
 
 # common flags and packages for 'dune install' and 'dune uninstall'
-DUNE_IU_PACKAGES1=-j $(JOBS) --destdir=$(DESTDIR) --prefix=$(PREFIX) --libdir=$(LIBDIR) --mandir=$(MANDIR)
+DUNE_IU_COMMON=-j $(JOBS) --destdir=$(DESTDIR) --libdir=$(LIBDIR) --mandir=$(MANDIR)
+DUNE_IU_PACKAGES1=$(DUNE_IU_COMMON) --prefix=$(PREFIX)
 DUNE_IU_PACKAGES1+=--libexecdir=$(XENOPSD_LIBEXECDIR) --datadir=$(SDKDIR)
 DUNE_IU_PACKAGES1+=xapi-client xapi-schema xapi-consts xapi-cli-protocol xapi-datamodel xapi-types
 DUNE_IU_PACKAGES1+=xen-api-client xen-api-client-lwt rrdd-plugin rrd-transport
 DUNE_IU_PACKAGES1+=gzip http-lib pciutil sexpr stunnel uuid xml-light2 zstd xapi-compression safe-resources
 DUNE_IU_PACKAGES1+=message-switch message-switch-cli message-switch-core message-switch-lwt
-DUNE_IU_PACKAGES1+=message-switch-unix xapi-idl forkexec xapi-forkexecd xapi-storage xapi-storage-script xapi-storage-cli
+DUNE_IU_PACKAGES1+=message-switch-unix xapi-idl xapi-forkexecd xapi-storage xapi-storage-script xapi-storage-cli
 DUNE_IU_PACKAGES1+=xapi-nbd varstored-guard xapi-log xapi-open-uri xapi-tracing xapi-tracing-export xapi-expiry-alerts cohttp-posix
-DUNE_IU_PACKAGES1+=xapi-rrd xapi-inventory clock xapi-sdk
-DUNE_IU_PACKAGES1+=xapi-stdext-date xapi-stdext-encodings xapi-stdext-pervasives xapi-stdext-std xapi-stdext-threads xapi-stdext-unix xapi-stdext-zerocheck xapi-tools
+DUNE_IU_PACKAGES1+=xapi-rrd xapi-inventory clock xapi-sdk tgroup
+DUNE_IU_PACKAGES1+=xapi-stdext-encodings xapi-stdext-pervasives xapi-stdext-std xapi-stdext-threads xapi-stdext-unix xapi-stdext-zerocheck xapi-tools
 
 
 install-dune1:
 # dune can install libraries and several other files into the right locations
 	dune install $(DUNE_IU_PACKAGES1)
 
-DUNE_IU_PACKAGES2=-j $(JOBS) --destdir=$(DESTDIR) --prefix=$(OPTDIR) --libdir=$(LIBDIR) --mandir=$(MANDIR) --libexecdir=$(OPTDIR)/libexec --datadir=$(DOCDIR)  xapi xe
+DUNE_IU_PACKAGES2=$(DUNE_IU_COMMON) --prefix=$(OPTDIR) --libexecdir=$(OPTDIR)/libexec --datadir=$(DOCDIR)  xapi xe
 
 install-dune2:
 	dune install $(DUNE_IU_PACKAGES2)
 
-DUNE_IU_PACKAGES3=-j $(JOBS) --destdir=$(DESTDIR) --prefix=$(OPTDIR) --libdir=$(LIBDIR) --mandir=$(MANDIR) --libexecdir=$(OPTDIR)/libexec --bindir=$(OPTDIR)/debug --datadir=$(OPTDIR)/debug xapi-debug
+DUNE_IU_PACKAGES3=$(DUNE_IU_COMMON) --prefix=$(OPTDIR) --libexecdir=$(OPTDIR)/libexec --bindir=$(OPTDIR)/debug --datadir=$(OPTDIR)/debug xapi-debug
 
 install-dune3:
 	dune install $(DUNE_IU_PACKAGES3)
 
-DUNE_IU_PACKAGES4=-j $(JOBS) --destdir=$(DESTDIR) --prefix=$(PREFIX) --libdir=$(LIBDIR) --libexecdir=/usr/libexec --mandir=$(MANDIR) vhd-tool
+DUNE_IU_PACKAGES4=$(DUNE_IU_COMMON) --prefix=$(PREFIX) --libexecdir=/usr/libexec vhd-tool forkexec qcow-stream-tool
 
 install-dune4:
 	dune install $(DUNE_IU_PACKAGES4)
@@ -186,7 +187,7 @@ install:
 	chmod +x $(DESTDIR)$(DOCDIR)/doc-convert.sh
 	# backward compat with existing specfile, to be removed after it is updated
 	find $(DESTDIR) -name '*.cmxs' -delete
-	for pkg in xapi-debug xapi xe xapi-tools xapi-sdk vhd-tool; do for f in CHANGELOG LICENSE README.markdown; do rm $(DESTDIR)$(OPTDIR)/doc/$$pkg/$$f $(DESTDIR)$(PREFIX)/doc/$$pkg/$$f -f; done; for f in META dune-package opam; do rm $(DESTDIR)$(LIBDIR)/$$pkg/$$f -f; done; done;
+	for pkg in xapi-debug xapi xe xapi-tools xapi-sdk vhd-tool qcow-stream-tool; do for f in CHANGELOG LICENSE README.markdown; do rm $(DESTDIR)$(OPTDIR)/doc/$$pkg/$$f $(DESTDIR)$(PREFIX)/doc/$$pkg/$$f -f; done; for f in META dune-package opam; do rm $(DESTDIR)$(LIBDIR)/$$pkg/$$f -f; done; done;
 
 
 uninstall:

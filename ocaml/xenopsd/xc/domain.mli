@@ -133,7 +133,7 @@ type build_info = {
   ; kernel: string  (** image to load. In HVM case, point to hvmloader *)
   ; vcpus: int  (** vcpus max *)
   ; priv: builder_spec_info
-  ; has_hard_affinity: bool
+  ; hard_affinity: int list list  (** vcpu -> pcpu map *)
 }
 
 val typ_of_build_info : build_info Rpc.Types.typ
@@ -149,6 +149,8 @@ val make :
   -> [`VM] Uuidx.t
   -> string option
   -> bool (* no_sharept *)
+  -> int (* num_of_vbds *)
+  -> int (* num_of_vifs *)
   -> domid
 (** Create a fresh (empty) domain with a specific UUID, returning the domain ID *)
 
@@ -245,9 +247,6 @@ val restore :
   -> xc:Xenctrl.handle
   -> xs:Ezxenstore_core.Xenstore.Xs.xsh
   -> dm:Device.Profile.t
-  -> store_domid:int
-  -> console_domid:int
-  -> no_incr_generationid:bool
   -> timeoffset:string
   -> extras:string list
   -> build_info

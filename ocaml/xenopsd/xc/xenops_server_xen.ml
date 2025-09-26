@@ -51,6 +51,8 @@ let _xenguest = "xenguest"
 
 let _emu_manager = "emu-manager"
 
+let ( // ) = Filename.concat
+
 let run cmd args =
   debug "%s %s" cmd (String.concat " " args) ;
   fst (Forkhelpers.execute_command_get_output cmd args)
@@ -58,20 +60,20 @@ let run cmd args =
 let choose_alternative kind default platformdata =
   debug "looking for %s in [ %s ]" kind
     (String.concat "; " (List.map (fun (k, v) -> k ^ " : " ^ v) platformdata)) ;
-  if List.mem_assoc kind platformdata then
-    let x = List.assoc kind platformdata in
-    let dir = Filename.concat !Xc_resources.alternatives kind in
-    let available = try Array.to_list (Sys.readdir dir) with _ -> [] in
+  let path_available x =
+    let dir = !Xc_resources.alternatives // kind in
+    let available = try Sys.readdir dir with _ -> [||] in
     (* If x has been put in the directory (by root) then it's safe to use *)
-    if List.mem x available then
-      Filename.concat dir x
+    if Array.mem x available then
+      Some (dir // x)
     else (
       error "Invalid platform:%s=%s (check execute permissions of %s)" kind x
-        (Filename.concat dir x) ;
-      default
+        (dir // x) ;
+      None
     )
-  else
-    default
+  in
+  Option.bind (List.assoc_opt kind platformdata) path_available
+  |> Option.value ~default
 
 (* We allow qemu-dm to be overriden via a platform flag *)
 let choose_qemu_dm x =
@@ -185,6 +187,7 @@ module VmExtra = struct
     ; pv_drivers_detected: bool [@default false]
     ; xen_platform: (int * int) option (* (device_id, revision) for QEMU *)
     ; platformdata: (string * string) list [@default []]
+    ; attached_vdis: (string * attached_vdi) list [@default []]
   }
   [@@deriving rpcty]
 
@@ -409,18 +412,16 @@ module Storage = struct
   let vm_of_domid = vm_of_domid
 
   (* We need to deal with driver domains here: *)
-  let attach_and_activate ~xc:_ ~xs task vm dp sr vdi read_write =
+  let attach ~xc:_ ~xs task vm dp sr vdi read_write =
     let vmdomid = vm_of_domid (domid_of_uuid ~xs (uuid_of_string vm)) in
-    let result =
-      attach_and_activate ~task ~_vm:vm ~vmdomid ~dp ~sr ~vdi ~read_write
-    in
+    let result = attach ~task ~_vm:vm ~vmdomid ~dp ~sr ~vdi ~read_write in
     let backend =
       Xenops_task.with_subtask task
         (Printf.sprintf "Policy.get_backend_vm %s %s %s" vm (Sr.string_of sr)
            (Vdi.string_of vdi)
         )
         (transform_exception (fun () ->
-             Client.Policy.get_backend_vm "attach_and_activate" vm sr vdi
+             Client.Policy.get_backend_vm "attach" vm sr vdi
          )
         )
     in
@@ -429,6 +430,10 @@ module Storage = struct
         failwith (Printf.sprintf "Driver domain disapppeared: %s" backend)
     | Some domid ->
         {domid; attach_info= result}
+
+  let activate ~xc:_ ~xs task vm dp sr vdi =
+    let vmdomid = vm_of_domid (domid_of_uuid ~xs (uuid_of_string vm)) in
+    activate ~task ~_vm:vm ~vmdomid ~dp ~sr ~vdi
 
   let deactivate = deactivate
 
@@ -504,10 +509,11 @@ let with_disk ~xc ~xs task disk write f =
         (fun () ->
           let frontend_domid = this_domid ~xs in
           let frontend_vm = get_uuid ~xc frontend_domid |> Uuidx.to_string in
-          let vdi =
-            attach_and_activate ~xc ~xs task frontend_vm dp sr vdi write
+          let attached_vdi = attach ~xc ~xs task frontend_vm dp sr vdi write in
+          activate ~xc ~xs task frontend_vm dp sr vdi ;
+          let device =
+            create_vbd_frontend ~xc ~xs task frontend_domid attached_vdi
           in
-          let device = create_vbd_frontend ~xc ~xs task frontend_domid vdi in
           finally
             (fun () ->
               match device with
@@ -1281,7 +1287,7 @@ module VM = struct
       ; kernel= ""
       ; vcpus= vm.vcpu_max
       ; priv= builder_spec_info
-      ; has_hard_affinity= vm.scheduler_params.affinity <> []
+      ; hard_affinity= vm.scheduler_params.affinity
       }
     in
     VmExtra.
@@ -1297,8 +1303,6 @@ module VM = struct
     |> rpc_of VmExtra.persistent_t
     |> Jsonrpc.to_string
 
-  let mkints n = List.init n Fun.id
-
   let generate_create_info ~xs:_ vm persistent =
     let ty = match persistent.VmExtra.ty with Some ty -> ty | None -> vm.ty in
     let hvm =
@@ -1306,38 +1310,6 @@ module VM = struct
     in
     (* XXX add per-vcpu information to the platform data *)
     (* VCPU configuration *)
-    let xcext = Xenctrlext.get_handle () in
-    let pcpus = Xenctrlext.get_max_nr_cpus xcext in
-    let all_pcpus = mkints pcpus in
-    let all_vcpus = mkints vm.vcpu_max in
-    let masks =
-      match vm.scheduler_params.affinity with
-      | [] ->
-          (* Every vcpu can run on every pcpu *)
-          List.map (fun _ -> all_pcpus) all_vcpus
-      | m :: ms ->
-          (* Treat the first as the template for the rest *)
-          let defaults = List.map (fun _ -> m) all_vcpus in
-          Xapi_stdext_std.Listext.List.take vm.vcpu_max ((m :: ms) @ defaults)
-    in
-    (* convert a mask into a binary string, one char per pCPU *)
-    let bitmap cpus : string =
-      let cpus = List.filter (fun x -> x >= 0 && x < pcpus) cpus in
-      let result = Bytes.make pcpus '0' in
-      List.iter (fun cpu -> Bytes.set result cpu '1') cpus ;
-      Bytes.unsafe_to_string result
-    in
-    let affinity =
-      snd
-        (List.fold_left
-           (fun (idx, acc) mask ->
-             ( idx + 1
-             , (Printf.sprintf "vcpu/%d/affinity" idx, bitmap mask) :: acc
-             )
-           )
-           (0, []) masks
-        )
-    in
     let weight =
       vm.scheduler_params.priority
       |> Option.map (fun (w, c) ->
@@ -1353,7 +1325,6 @@ module VM = struct
             (match vm.ty with PVinPVH _ -> vm.vcpu_max | _ -> vm.vcpus)
         )
       ]
-      @ affinity
       @ weight
     in
     let set_generation_id platformdata =
@@ -1418,7 +1389,8 @@ module VM = struct
         in
         (device_id, revision)
 
-  let create_exn task memory_upper_bound vm final_id no_sharept =
+  let create_exn task memory_upper_bound vm final_id no_sharept num_of_vbds
+      num_of_vifs =
     let k = vm.Vm.id in
     with_xc_and_xs (fun xc xs ->
         (* Ensure the DB contains something for this VM - this is to avoid a
@@ -1547,7 +1519,8 @@ module VM = struct
                   let create_info = generate_create_info ~xs vm persistent in
                   let domid =
                     Domain.make ~xc ~xs create_info vm.vcpu_max domain_config
-                      (uuid_of_vm vm) final_id no_sharept
+                      (uuid_of_vm vm) final_id no_sharept num_of_vbds
+                      num_of_vifs
                   in
                   Mem.transfer_reservation_to_domain dbg domid reservation_id ;
                   let initial_target =
@@ -2034,7 +2007,7 @@ module VM = struct
       ; kernel
       ; vcpus= vm.vcpu_max
       ; priv
-      ; has_hard_affinity= vm.scheduler_params.affinity <> []
+      ; hard_affinity= vm.scheduler_params.affinity
       }
     in
     debug "static_max_mib=%Ld" static_max_mib ;
@@ -2313,10 +2286,12 @@ module VM = struct
         )
         (create_device_model_config vm vmextra vbds vifs vgpus vusbs) ;
       match vm.Vm.ty with
-      | Vm.PV {vncterm= true; vncterm_ip= ip; _}
-      | Vm.PVinPVH {vncterm= true; vncterm_ip= ip; _} ->
-          Service.PV_Vnc.start ~xs ?ip di.Xenctrl.domid
-      | _ ->
+      | PV {vncterm; vncterm_ip= ip; _}
+      | PVH {vncterm; vncterm_ip= ip; _}
+      | PVinPVH {vncterm; vncterm_ip= ip; _} ->
+          if vncterm then
+            Service.PV_Vnc.start ~xs ?ip di.Xenctrl.domid
+      | HVM _ ->
           ()
     with Device.Ioemu_failed (name, msg) ->
       raise (Xenopsd_error (Failed_to_start_emulator (vm.Vm.id, name, msg)))
@@ -2513,6 +2488,7 @@ module VM = struct
                 @@ fun () -> pre_suspend_callback task
                 ) ;
 
+                with_tracing ~task ~name:"VM_save_request_shutdown" @@ fun () ->
                 if
                   not
                     ( with_tracing ~task
@@ -2521,6 +2497,13 @@ module VM = struct
                     )
                 then
                   raise (Xenopsd_error Failed_to_acknowledge_suspend_request) ;
+                (* If this is for a migration, record the begin time *)
+                ( match data with
+                | FD _ ->
+                    with_tracing ~task ~name:"VM_migrate_downtime_begin" Fun.id
+                | _ ->
+                    ()
+                ) ;
                 if
                   not
                     ( with_tracing ~task
@@ -2645,7 +2628,6 @@ module VM = struct
             in
             ({x with Domain.memory_target= initial_target}, timeoffset)
       in
-      let no_incr_generationid = false in
       let vtpm = vtpm_of ~vm in
       ( try
           with_data ~xc ~xs task data false @@ fun fd ->
@@ -2661,9 +2643,8 @@ module VM = struct
                 None
           in
           let manager_path = choose_emu_manager vm.Vm.platformdata in
-          Domain.restore task ~xc ~xs ~dm:(dm_of ~vm) ~store_domid
-            ~console_domid ~no_incr_generationid (* XXX progress_callback *)
-            ~timeoffset ~extras build_info ~manager_path ~vtpm domid fd vgpu_fd
+          Domain.restore task ~xc ~xs ~dm:(dm_of ~vm) ~timeoffset ~extras
+            build_info ~manager_path ~vtpm domid fd vgpu_fd
         with e ->
           error "VM %s: restore failed: %s" vm.Vm.id (Printexc.to_string e) ;
           (* As of xen-unstable.hg 779c0ef9682 libxenguest will destroy
@@ -2744,9 +2725,10 @@ module VM = struct
                 (fun port -> {Vm.protocol= Vm.Vt100; port; path= ""})
                 (Device.get_tc_port ~xs di.Xenctrl.domid)
             in
-            let local x =
-              Printf.sprintf "/local/domain/%d/%s" di.Xenctrl.domid x
+            let root_path =
+              Printf.sprintf "/local/domain/%d" di.Xenctrl.domid
             in
+            let local x = Printf.sprintf "%s/%s" root_path x in
             let uncooperative =
               try
                 ignore_string (xs.Xs.read (local "memory/uncooperative")) ;
@@ -2849,12 +2831,11 @@ module VM = struct
               ; ("drivers", None, 0)
               ; ("data", None, 0)
                 (* in particular avoid data/volumes which contains many entries for each disk *)
+              ; ("data/service", None, 1) (* data/service/<service-name>/<key>*)
               ]
               |> List.fold_left
                    (fun acc (dir, excludes, depth) ->
-                     ls_lR ?excludes ~depth
-                       (Printf.sprintf "/local/domain/%d" di.Xenctrl.domid)
-                       acc dir
+                     ls_lR ?excludes ~depth root_path acc dir
                    )
                    (quota, [])
               |> fun (quota, acc) ->
@@ -2862,9 +2843,7 @@ module VM = struct
             in
             let quota, xsdata_state =
               Domain.allowed_xsdata_prefixes
-              |> List.fold_left
-                   (ls_lR (Printf.sprintf "/local/domain/%d" di.Xenctrl.domid))
-                   (quota, [])
+              |> List.fold_left (ls_lR root_path) (quota, [])
             in
             let path =
               Device_common.xenops_path_of_domain di.Xenctrl.domid
@@ -3528,11 +3507,14 @@ module VBD = struct
   let vdi_attach_path vbd =
     Printf.sprintf "/xapi/%s/private/vdis/%s" (fst vbd.id) (snd vbd.id)
 
-  let attach_and_activate task xc xs frontend_domid vbd vdi =
-    let vdi =
-      match vdi with
-      | None ->
-          (* XXX: do something better with CDROMs *)
+  type attachment_status = Attached of attached_vdi | PathToAttach of string
+
+  (* For vdis that are None or local, return Attached attached_vdi, otherwise return PathToAttach path *)
+  let attachment_status_of_vdi xs vdi =
+    match vdi with
+    | None ->
+        (* XXX: do something better with CDROMs *)
+        Attached
           {
             domid= this_domid ~xs
           ; attach_info=
@@ -3545,7 +3527,8 @@ module VBD = struct
                     ]
                 }
           }
-      | Some (Local path) ->
+    | Some (Local path) ->
+        Attached
           {
             domid= this_domid ~xs
           ; attach_info=
@@ -3558,16 +3541,33 @@ module VBD = struct
                     ]
                 }
           }
-      | Some (VDI path) ->
+    | Some (VDI path) ->
+        PathToAttach path
+
+  let attach' task xc xs frontend_domid vbd vdi =
+    let vdi =
+      match attachment_status_of_vdi xs vdi with
+      | Attached attached_vdi ->
+          attached_vdi
+      | PathToAttach path ->
           let sr, vdi = Storage.get_disk_by_name task path in
           let dp = Storage.id_of (string_of_int frontend_domid) vbd.id in
           let vm = fst vbd.id in
-          Storage.attach_and_activate ~xc ~xs task vm dp sr vdi
-            (vbd.mode = ReadWrite)
+          Storage.attach ~xc ~xs task vm dp sr vdi (vbd.mode = ReadWrite)
     in
     xs.Xs.write (vdi_attach_path vbd)
       (vdi |> rpc_of attached_vdi |> Jsonrpc.to_string) ;
     vdi
+
+  let activate' task xc xs frontend_domid vbd vdi =
+    match attachment_status_of_vdi xs vdi with
+    | Attached _ ->
+        ()
+    | PathToAttach path ->
+        let sr, vdi = Storage.get_disk_by_name task path in
+        let dp = Storage.id_of (string_of_int frontend_domid) vbd.id in
+        let vm = fst vbd.id in
+        Storage.activate ~xc ~xs task vm dp sr vdi
 
   let frontend_domid_of_device device =
     device.Device_common.frontend.Device_common.domid
@@ -3647,153 +3647,221 @@ module VBD = struct
   let vdi_path_of_device ~xs device =
     Device_common.backend_path_of_device ~xs device ^ "/vdi"
 
-  let plug task vm vbd =
+  let attach task vm vbd =
     (* If the vbd isn't listed as "active" then we don't automatically plug this
-       one in *)
-    if not (get_active vm vbd) then
-      debug "VBD %s.%s is not active: not plugging into VM" (fst vbd.Vbd.id)
-        (snd vbd.Vbd.id)
-    else
-      on_frontend
-        (fun xc xs frontend_domid domain_type ->
-          if vbd.backend = None && domain_type <> Vm.Domain_HVM then
-            info
-              "VM = %s; an empty CDROM drive on PV and PVinPVH guests is \
-               simulated by unplugging the whole drive"
-              vm
-          else
-            let vdi =
-              attach_and_activate task xc xs frontend_domid vbd vbd.backend
-            in
-            let params, xenstore_data, extra_keys =
-              params_of_backend vdi.attach_info
-            in
-            let new_keys =
-              List.map (fun (k, v) -> ("sm-data/" ^ k, v)) xenstore_data
-              @ extra_keys
-            in
-            let extra_backend_keys =
-              List.fold_left
-                (fun acc (k, v) -> (k, v) :: List.remove_assoc k acc)
-                vbd.extra_backend_keys new_keys
-            in
-            let kind = device_kind_of ~xs vbd in
-            (* Remember the VBD id with the device *)
-            let vbd_id = (_device_id kind, id_of vbd) in
-            (* Remember the VDI with the device (for later deactivation) *)
-            let vdi_id =
-              (_vdi_id, vbd.backend |> rpc_of backend |> Jsonrpc.to_string)
-            in
-            let dp_id =
-              (_dp_id, Storage.id_of (string_of_int frontend_domid) vbd.Vbd.id)
-            in
-            let x =
-              {
-                Device.Vbd.mode=
-                  ( match vbd.mode with
-                  | ReadOnly ->
-                      Device.Vbd.ReadOnly
-                  | ReadWrite ->
-                      Device.Vbd.ReadWrite
-                  )
-              ; device_number= vbd.position
-              ; phystype= Device.Vbd.Phys
-              ; params
-              ; dev_type=
-                  ( match vbd.ty with
-                  | CDROM ->
-                      Device.Vbd.CDROM
-                  | Disk ->
-                      Device.Vbd.Disk
-                  | Floppy ->
-                      Device.Vbd.Floppy
-                  )
-              ; unpluggable= vbd.unpluggable
-              ; protocol= None
-              ; kind
-              ; extra_backend_keys
-              ; extra_private_keys=
-                  dp_id :: vdi_id :: vbd_id :: vbd.extra_private_keys
-              ; backend_domid= vdi.domid
-              }
-            in
-            let dev =
-              Xenops_task.with_subtask task
-                (Printf.sprintf "Vbd.add %s" (id_of vbd))
-                (fun () ->
-                  Device.Vbd.add task ~xc ~xs
-                    ~hvm:(domain_type = Vm.Domain_HVM)
-                    x frontend_domid
-                )
-            in
-            (* We store away the disk so we can implement VBD.stat *)
-            Option.iter
-              (fun d ->
-                xs.Xs.write
-                  (vdi_path_of_device ~xs dev)
-                  (d |> rpc_of disk |> Jsonrpc.to_string)
-              )
-              vbd.backend ;
-            (* NB now the frontend position has been resolved *)
-            let open Device_common in
-            let device_number =
-              dev.frontend.devid |> Device_number.of_xenstore_key
-            in
-            let qemu_domid = this_domid ~xs in
-            let qemu_frontend =
-              let maybe_create_vbd_frontend () =
-                let index = Device_number.disk device_number in
-                match vbd.Vbd.backend with
-                | None ->
-                    Some (index, Empty)
-                | Some _ ->
-                    Some (index, create_vbd_frontend ~xc ~xs task qemu_domid vdi)
-              in
-              match (device_number :> Device_number.bus_type * int * int) with
-              | Ide, n, _ when 0 <= n && n < 4 ->
-                  maybe_create_vbd_frontend ()
-              | Floppy, n, _ when 0 <= n && n < 2 ->
-                  maybe_create_vbd_frontend ()
-              | Ide, n, _ ->
-                  D.warn
-                    "qemu_frontend: Ide supports device numbers between 0 and \
-                     3, but got: %i"
-                    n ;
-                  None
-              | Floppy, n, _ ->
-                  D.warn
-                    "qemu_frontend: Floppy supports device numbers between 0 \
-                     and 1, but got: %i"
-                    n ;
-                  None
-              | (Xen | Scsi), _, _ ->
-                  None
-            in
-            (* Remember what we've just done *)
-            (* Dom0 doesn't have a vm_t - we don't need this currently, but when
-               we have storage driver domains, we will. Also this causes the
-               SMRT tests to fail, as they demand the loopback VBDs *)
-            Option.iter
-              (fun q ->
-                let _ =
-                  DB.update_exn vm (fun vm_t ->
-                      Some
-                        VmExtra.
-                          {
-                            persistent=
-                              {
-                                vm_t.VmExtra.persistent with
-                                qemu_vbds=
-                                  (vbd.Vbd.id, q) :: vm_t.persistent.qemu_vbds
-                              }
-                          }
+        one in *)
+    let attached_vdi =
+      if not (get_active vm vbd) then (
+        debug "VBD %s.%s is not active: not plugging into VM" (fst vbd.Vbd.id)
+          (snd vbd.Vbd.id) ;
+        None
+      ) else
+        on_frontend
+          (fun xc xs frontend_domid domain_type ->
+            if vbd.backend = None && domain_type <> Vm.Domain_HVM then (
+              info
+                "VM = %s; an empty CDROM drive on PV and PVinPVH guests is \
+                 simulated by unplugging the whole drive"
+                vm ;
+              None
+            ) else
+              Some (attach' task xc xs frontend_domid vbd vbd.backend)
+          )
+          vm
+    in
+    match attached_vdi with
+    | None ->
+        ()
+    | Some vdi ->
+        (* Record the attached_vdi so it can be used in activate *)
+        let _ =
+          DB.update_exn vm (fun vm_t ->
+              Some
+                VmExtra.
+                  {
+                    persistent=
+                      {
+                        vm_t.VmExtra.persistent with
+                        (* Index by id_of vbd rather than vbd.id as VmExtra is
+                           already indexed by VM id, so the VM id part of
+                           vbd.id is unnecessary and causes issues finding the
+                           attached_vdi when the VM is renamed. *)
+                        attached_vdis=
+                          (id_of vbd, vdi)
+                          :: List.remove_assoc (id_of vbd)
+                               vm_t.persistent.attached_vdis
+                      }
+                  }
+          )
+        in
+        ()
+
+  let cleanup_attached_vdis vm vbd_id =
+    let _ =
+      DB.update_exn vm (fun vm_t ->
+          let remaining_vdis =
+            List.remove_assoc vbd_id vm_t.persistent.attached_vdis
+          in
+          Some
+            {persistent= {vm_t.persistent with attached_vdis= remaining_vdis}}
+      )
+    in
+    ()
+
+  let activate task vm vbd =
+    let vmextra = DB.read_exn vm in
+    match List.assoc_opt (id_of vbd) vmextra.persistent.attached_vdis with
+    | None ->
+        debug "No attached_vdi info, so not activating"
+    | Some vdi ->
+        finally
+          (fun () ->
+            on_frontend
+              (fun xc xs frontend_domid domain_type ->
+                activate' task xc xs frontend_domid vbd vbd.backend ;
+                let params, xenstore_data, extra_keys =
+                  params_of_backend vdi.attach_info
+                in
+                let new_keys =
+                  List.map (fun (k, v) -> ("sm-data/" ^ k, v)) xenstore_data
+                  @ extra_keys
+                in
+                let extra_backend_keys =
+                  List.fold_left
+                    (fun acc (k, v) -> (k, v) :: List.remove_assoc k acc)
+                    vbd.extra_backend_keys new_keys
+                in
+                let kind = device_kind_of ~xs vbd in
+                (* Remember the VBD id with the device *)
+                let vbd_id = (_device_id kind, id_of vbd) in
+                (* Remember the VDI with the device (for later deactivation) *)
+                let vdi_id =
+                  (_vdi_id, vbd.backend |> rpc_of backend |> Jsonrpc.to_string)
+                in
+                let dp_id =
+                  ( _dp_id
+                  , Storage.id_of (string_of_int frontend_domid) vbd.Vbd.id
                   )
                 in
-                ()
+                let x =
+                  {
+                    Device.Vbd.mode=
+                      ( match vbd.mode with
+                      | ReadOnly ->
+                          Device.Vbd.ReadOnly
+                      | ReadWrite ->
+                          Device.Vbd.ReadWrite
+                      )
+                  ; device_number= vbd.position
+                  ; phystype= Device.Vbd.Phys
+                  ; params
+                  ; dev_type=
+                      ( match vbd.ty with
+                      | CDROM ->
+                          Device.Vbd.CDROM
+                      | Disk ->
+                          Device.Vbd.Disk
+                      | Floppy ->
+                          Device.Vbd.Floppy
+                      )
+                  ; unpluggable= vbd.unpluggable
+                  ; protocol= None
+                  ; kind
+                  ; extra_backend_keys
+                  ; extra_private_keys=
+                      dp_id :: vdi_id :: vbd_id :: vbd.extra_private_keys
+                  ; backend_domid= vdi.domid
+                  }
+                in
+                let dev =
+                  with_tracing ~task ~name:"VBD_activate_add" @@ fun () ->
+                  Xenops_task.with_subtask task
+                    (Printf.sprintf "Vbd.add %s" (id_of vbd))
+                    (fun () ->
+                      Device.Vbd.add task ~xc ~xs
+                        ~hvm:(domain_type = Vm.Domain_HVM)
+                        x frontend_domid
+                    )
+                in
+                (* We store away the disk so we can implement VBD.stat *)
+                ( with_tracing ~task ~name:"VBD_activate_xs_write" @@ fun () ->
+                  Option.iter
+                    (fun d ->
+                      xs.Xs.write
+                        (vdi_path_of_device ~xs dev)
+                        (d |> rpc_of disk |> Jsonrpc.to_string)
+                    )
+                    vbd.backend
+                ) ;
+                with_tracing ~task ~name:"VBD_activate_qemu" @@ fun () ->
+                (* NB now the frontend position has been resolved *)
+                let open Device_common in
+                let device_number =
+                  dev.frontend.devid |> Device_number.of_xenstore_key
+                in
+                let qemu_domid = this_domid ~xs in
+                let qemu_frontend =
+                  let maybe_create_vbd_frontend () =
+                    let index = Device_number.disk device_number in
+                    match vbd.Vbd.backend with
+                    | None ->
+                        Some (index, Empty)
+                    | Some _ ->
+                        Some
+                          ( index
+                          , create_vbd_frontend ~xc ~xs task qemu_domid vdi
+                          )
+                  in
+                  match
+                    (device_number :> Device_number.bus_type * int * int)
+                  with
+                  | Ide, n, _ when 0 <= n && n < 4 ->
+                      maybe_create_vbd_frontend ()
+                  | Floppy, n, _ when 0 <= n && n < 2 ->
+                      maybe_create_vbd_frontend ()
+                  | Ide, n, _ ->
+                      D.warn
+                        "qemu_frontend: Ide supports device numbers between 0 \
+                         and 3, but got: %i"
+                        n ;
+                      None
+                  | Floppy, n, _ ->
+                      D.warn
+                        "qemu_frontend: Floppy supports device numbers between \
+                         0 and 1, but got: %i"
+                        n ;
+                      None
+                  | (Xen | Scsi), _, _ ->
+                      None
+                in
+                (* Remember what we've just done *)
+                (* Dom0 doesn't have a vm_t - we don't need this currently, but when
+                    we have storage driver domains, we will. Also this causes the
+                    SMRT tests to fail, as they demand the loopback VBDs *)
+                Option.iter
+                  (fun q ->
+                    let _ =
+                      DB.update_exn vm (fun vm_t ->
+                          Some
+                            VmExtra.
+                              {
+                                persistent=
+                                  {
+                                    vm_t.VmExtra.persistent with
+                                    qemu_vbds=
+                                      (vbd.Vbd.id, q)
+                                      :: vm_t.persistent.qemu_vbds
+                                  }
+                              }
+                      )
+                    in
+                    ()
+                  )
+                  qemu_frontend
               )
-              qemu_frontend
-        )
-        vm
+              vm
+          )
+          (fun () -> cleanup_attached_vdis vm (id_of vbd))
 
   let unplug task vm vbd force =
     with_xc_and_xs (fun xc xs ->
@@ -3849,6 +3917,7 @@ module VBD = struct
               (* this happens on normal shutdown too *)
               (* Case (1): success; Case (2): success; Case (3): an exception is
                  thrown *)
+              with_tracing ~task ~name:"VBD_device_shutdown" @@ fun () ->
               Xenops_task.with_subtask task
                 (Printf.sprintf "Vbd.clean_shutdown %s" (id_of vbd))
                 (fun () ->
@@ -3861,14 +3930,17 @@ module VBD = struct
              the DP if the backend is of type VDI *)
           finally
             (fun () ->
-              Option.iter
-                (fun dev ->
-                  Xenops_task.with_subtask task
-                    (Printf.sprintf "Vbd.release %s" (id_of vbd))
-                    (fun () -> Device.Vbd.release task ~xc ~xs dev)
-                )
-                dev ;
+              with_tracing ~task ~name:"VBD_device_release" (fun () ->
+                  Option.iter
+                    (fun dev ->
+                      Xenops_task.with_subtask task
+                        (Printf.sprintf "Vbd.release %s" (id_of vbd))
+                        (fun () -> Device.Vbd.release task ~xc ~xs dev)
+                    )
+                    dev
+              ) ;
               (* If we have a qemu frontend, detach this too. *)
+              with_tracing ~task ~name:"VBD_detach_qemu" @@ fun () ->
               let _ =
                 DB.update vm
                   (Option.map (fun vm_t ->
@@ -3899,6 +3971,7 @@ module VBD = struct
               ()
             )
             (fun () ->
+              with_tracing ~task ~name:"VBD_dp_destroy" @@ fun () ->
               match (domid, backend) with
               | Some x, None | Some x, Some (VDI _) ->
                   Storage.dp_destroy task
@@ -3911,18 +3984,182 @@ module VBD = struct
           raise (Xenopsd_error (Device_detach_rejected ("VBD", id_of vbd, s)))
     )
 
+  let deactivate task vm vbd force =
+    with_xc_and_xs (fun xc xs ->
+        try
+          (* On destroying the datapath
+
+              1. if the device has already been shutdown and deactivated (as in
+              suspend) we must call DP.destroy here to avoid leaks
+
+              2. if the device is successfully shutdown here then we must call
+              DP.destroy because no-one else will
+
+              3. if the device shutdown is rejected then we should leave the DP
+              alone and rely on the event thread calling us again later. *)
+          let domid = domid_of_uuid ~xs (uuid_of_string vm) in
+          (* If the device is gone then we don't need to shut it down but we do
+              need to free any storage resources. *)
+          let dev =
+            try
+              Some (device_by_id xc xs vm (device_kind_of ~xs vbd) (id_of vbd))
+            with
+            | Xenopsd_error (Does_not_exist (_, _)) ->
+                debug "VM = %s; VBD = %s; Ignoring missing domain" vm (id_of vbd) ;
+                None
+            | Xenopsd_error Device_not_connected ->
+                debug "VM = %s; VBD = %s; Ignoring missing device" vm (id_of vbd) ;
+                None
+          in
+          let backend =
+            match dev with
+            | None ->
+                None
+            | Some dv -> (
+              match
+                Rpcmarshal.unmarshal typ_of_backend
+                  (Device.Generic.get_private_key ~xs dv _vdi_id
+                  |> Jsonrpc.of_string
+                  )
+              with
+              | Ok x ->
+                  x
+              | Error (`Msg m) ->
+                  internal_error "Failed to unmarshal VBD backend: %s" m
+            )
+          in
+          Option.iter
+            (fun dev ->
+              if force && not (Device.can_surprise_remove ~xs dev) then
+                debug
+                  "VM = %s; VBD = %s; Device is not surprise-removable \
+                   (ignoring and removing anyway)"
+                  vm (id_of vbd) ;
+              (* this happens on normal shutdown too *)
+              (* Case (1): success; Case (2): success; Case (3): an exception is
+                  thrown *)
+              with_tracing ~task ~name:"VBD_device_shutdown" @@ fun () ->
+              Xenops_task.with_subtask task
+                (Printf.sprintf "Vbd.clean_shutdown %s" (id_of vbd))
+                (fun () ->
+                  (if force then Device.hard_shutdown else Device.clean_shutdown)
+                    task ~xs dev
+                )
+            )
+            dev ;
+          (* We now have a shutdown device but an active DP: we should destroy
+              the DP if the backend is of type VDI *)
+          finally
+            (fun () ->
+              with_tracing ~task ~name:"VBD_device_release" (fun () ->
+                  Option.iter
+                    (fun dev ->
+                      Xenops_task.with_subtask task
+                        (Printf.sprintf "Vbd.release %s" (id_of vbd))
+                        (fun () -> Device.Vbd.release task ~xc ~xs dev)
+                    )
+                    dev
+              ) ;
+              (* If we have a qemu frontend, detach this too. *)
+              with_tracing ~task ~name:"VBD_detach_qemu" @@ fun () ->
+              let _ =
+                DB.update vm
+                  (Option.map (fun vm_t ->
+                       let persistent = vm_t.VmExtra.persistent in
+                       if List.mem_assoc vbd.Vbd.id persistent.VmExtra.qemu_vbds
+                       then (
+                         let _, qemu_vbd =
+                           List.assoc vbd.Vbd.id persistent.VmExtra.qemu_vbds
+                         in
+                         (* destroy_vbd_frontend ignores 'refusing to close'
+                            transients' *)
+                         destroy_vbd_frontend ~xc ~xs task qemu_vbd ;
+                         VmExtra.
+                           {
+                             persistent=
+                               {
+                                 persistent with
+                                 qemu_vbds=
+                                   List.remove_assoc vbd.Vbd.id
+                                     persistent.qemu_vbds
+                               }
+                           }
+                       ) else
+                         vm_t
+                   )
+                  )
+              in
+              ()
+            )
+            (fun () ->
+              with_tracing ~task ~name:"VBD_deactivate" @@ fun () ->
+              let vmid = Storage.vm_of_domid domid in
+              match (domid, backend) with
+              | Some x, Some (VDI path) ->
+                  let sr, vdi = Storage.get_disk_by_name task path in
+                  let dp = Storage.id_of (string_of_int x) vbd.id in
+                  Storage.deactivate task dp sr vdi vmid
+              (* We don't need to detach Local or CDROM *)
+              | _ ->
+                  ()
+            )
+        with Device_common.Device_error (_, s) ->
+          debug "Caught Device_error: %s" s ;
+          raise (Xenopsd_error (Device_detach_rejected ("VBD", id_of vbd, s)))
+    )
+
+  let detach task vm vbd =
+    with_xc_and_xs (fun xc xs ->
+        let domid = domid_of_uuid ~xs (uuid_of_string vm) in
+        let dev =
+          try
+            Some (device_by_id xc xs vm (device_kind_of ~xs vbd) (id_of vbd))
+          with
+          | Xenopsd_error (Does_not_exist (_, _)) ->
+              debug "VM = %s; VBD = %s; Ignoring missing domain" vm (id_of vbd) ;
+              None
+          | Xenopsd_error Device_not_connected ->
+              debug "VM = %s; VBD = %s; Ignoring missing device" vm (id_of vbd) ;
+              None
+        in
+        let backend =
+          match dev with
+          | None ->
+              None
+          | Some dv -> (
+            match
+              Rpcmarshal.unmarshal typ_of_backend
+                (Device.Generic.get_private_key ~xs dv _vdi_id
+                |> Jsonrpc.of_string
+                )
+            with
+            | Ok x ->
+                x
+            | Error (`Msg m) ->
+                internal_error "Failed to unmarshal VBD backend: %s" m
+          )
+        in
+        with_tracing ~task ~name:"VBD_dp_destroy" @@ fun () ->
+        match (domid, backend) with
+        | Some x, None | Some x, Some (VDI _) ->
+            Storage.dp_destroy task (Storage.id_of (string_of_int x) vbd.Vbd.id)
+        | _ ->
+            ()
+    ) ;
+    cleanup_attached_vdis vm (id_of vbd)
+
   let insert task vm vbd d =
     on_frontend
       (fun xc xs frontend_domid domain_type ->
-        if domain_type <> Vm.Domain_HVM then
-          plug task vm {vbd with backend= Some d}
-        else
+        if domain_type <> Vm.Domain_HVM then (
+          attach task vm {vbd with backend= Some d} ;
+          activate task vm {vbd with backend= Some d}
+        ) else
           let (device : Device_common.device) =
             device_by_id xc xs vm (device_kind_of ~xs vbd) (id_of vbd)
           in
-          let vdi =
-            attach_and_activate task xc xs frontend_domid vbd (Some d)
-          in
+          let vdi = attach' task xc xs frontend_domid vbd (Some d) in
+          activate' task xc xs frontend_domid vbd (Some d) ;
           let params, xenstore_data, _ = params_of_backend vdi.attach_info in
           let phystype = Device.Vbd.Phys in
           (* We store away the disk so we can implement VBD.stat *)
@@ -4823,8 +5060,8 @@ module Actions = struct
     let open Printf in
     [
       sprintf "/local/domain/%d/attr" domid
-    ; sprintf "/local/domain/%d/data/updated" domid
     ; sprintf "/local/domain/%d/data/ts" domid
+    ; sprintf "/local/domain/%d/data/service" domid
     ; sprintf "/local/domain/%d/memory/target" domid
     ; sprintf "/local/domain/%d/memory/uncooperative" domid
     ; sprintf "/local/domain/%d/console/vnc-port" domid
@@ -5146,8 +5383,11 @@ let init () =
         {Xs_protocol.ACL.owner= 0; other= Xs_protocol.ACL.READ; acl= []}
   ) ;
   Device.Backend.init () ;
-  Xenops_server.numa_placement :=
+  Xenops_server.default_numa_affinity_policy :=
     if !Xenopsd.numa_placement_compat then Best_effort else Any ;
+  info "Default NUMA affinity policy is '%s'"
+    Xenops_server.(string_of_numa_affinity_policy !default_numa_affinity_policy) ;
+  Xenops_server.numa_placement := !Xenops_server.default_numa_affinity_policy ;
   Domain.numa_init () ;
   debug "xenstore is responding to requests" ;
   let () = Watcher.create_watcher_thread () in

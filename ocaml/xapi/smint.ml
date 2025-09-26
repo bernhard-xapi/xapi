@@ -36,6 +36,7 @@ module Feature = struct
     | Sr_metadata
     | Sr_trim
     | Sr_multipath
+    | Sr_caching
     | Vdi_create
     | Vdi_delete
     | Vdi_attach
@@ -75,6 +76,7 @@ module Feature = struct
     ; ("SR_METADATA", Sr_metadata)
     ; ("SR_TRIM", Sr_trim)
     ; ("SR_MULTIPATH", Sr_multipath)
+    ; ("SR_CACHING", Sr_caching)
     ; ("SR_STATS", Sr_stats)
     ; ("VDI_CREATE", Vdi_create)
     ; ("VDI_DELETE", Vdi_delete)
@@ -130,7 +132,7 @@ module Feature = struct
         Some (feature, 1L)
     )
     | feature :: _ ->
-        error "SM.feature: unknown feature %s" feature ;
+        warn "SM.feature: unknown feature %s" feature ;
         None
 
   (** [compat_features features1 features2] finds the compatible features in the input
@@ -190,6 +192,7 @@ type sr_driver_info = {
   ; sr_driver_text_features: string list
   ; sr_driver_configuration: (string * string) list
   ; sr_driver_required_cluster_stack: string list
+  ; sr_smapi_version: Storage_interface.smapi_version
 }
 
 let query_result_of_sr_driver_info x =
@@ -204,6 +207,7 @@ let query_result_of_sr_driver_info x =
   ; features= x.sr_driver_text_features
   ; configuration= x.sr_driver_configuration
   ; required_cluster_stack= x.sr_driver_required_cluster_stack
+  ; smapi_version= x.sr_smapi_version
   }
 
 type attach_info = {

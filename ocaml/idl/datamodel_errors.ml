@@ -68,7 +68,7 @@ let _ =
       "The license-server connection details (address or port) were missing or \
        incomplete."
     () ;
-  error Api_errors.license_checkout_error ["reason"]
+  error Api_errors.license_checkout_error ["code"; "message"]
     ~doc:"The license for the edition you requested is not available." () ;
   error Api_errors.license_file_deprecated []
     ~doc:
@@ -532,31 +532,14 @@ let _ =
       "You attempted an operation on a VM which requires a more recent version \
        of the PV drivers. Please upgrade your PV drivers."
     () ;
-  error Api_errors.vm_lacks_feature_shutdown ["vm"]
-    ~doc:
-      "You attempted an operation which needs the cooperative shutdown feature \
-       on a VM which lacks it."
-    () ;
-  error Api_errors.vm_lacks_feature_vcpu_hotplug ["vm"]
-    ~doc:
-      "You attempted an operation which needs the VM hotplug-vcpu feature on a \
-       VM which lacks it."
-    () ;
-  error Api_errors.vm_lacks_feature_suspend ["vm"]
-    ~doc:
-      "You attempted an operation which needs the VM cooperative suspend \
-       feature on a VM which lacks it."
-    () ;
-  error Api_errors.vm_lacks_feature_static_ip_setting ["vm"]
-    ~doc:
-      "You attempted an operation which needs the VM static-ip-setting feature \
-       on a VM which lacks it."
-    () ;
   error Api_errors.vm_lacks_feature ["vm"]
     ~doc:"You attempted an operation on a VM which lacks the feature." () ;
+  error Api_errors.vm_non_suspendable ["vm"; "reason"]
+    ~doc:"You attempted an operation on a VM which is not suspendable." () ;
   error Api_errors.vm_is_template ["vm"]
     ~doc:"The operation attempted is not valid for a template VM" () ;
-  error Api_errors.other_operation_in_progress ["class"; "object"]
+  error Api_errors.other_operation_in_progress
+    ["class"; "object"; "operation_type"; "operation_ref"]
     ~doc:"Another operation involving the object is currently in progress" () ;
   error Api_errors.vbd_not_removable_media ["vbd"]
     ~doc:"Media could not be ejected because it is not removable" () ;
@@ -664,6 +647,11 @@ let _ =
     ~doc:
       "The specified server is disabled and cannot be re-enabled until after \
        it has rebooted."
+    () ;
+  error Api_errors.host_disabled_indefinitely ["host"]
+    ~doc:
+      "The specified server is disabled and can only be re-enabled manually \
+       with Host.enable."
     () ;
   error Api_errors.no_hosts_available []
     ~doc:"There were no servers available to complete the specified operation."
@@ -896,6 +884,14 @@ let _ =
       "The host joining the pool has an incompatible set of sm features from \
        the pool coordinator. Make sure the sm are of the same versions and try \
        again."
+    () ;
+  error Api_errors.pool_joining_pool_cannot_enable_clustering_on_vlan_network
+    ["vlan"] ~doc:"The remote pool cannot enable clustering on vlan network" () ;
+  error Api_errors.pool_joining_host_must_have_only_one_IP_on_clustering_network
+    []
+    ~doc:
+      "The host joining the pool must have one and only one IP on the \
+       clustering network"
     () ;
 
   (* External directory service *)
@@ -1700,8 +1696,8 @@ let _ =
     ~doc:"The provided certificate has expired." () ;
   error Api_errors.server_certificate_signature_not_supported []
     ~doc:
-      "The provided certificate is not using the SHA256 (SHA2) signature \
-       algorithm."
+      "The provided certificate is not using one of the following SHA2 \
+       signature algorithms:  SHA256, SHA512."
     () ;
 
   error Api_errors.server_certificate_chain_invalid []
@@ -1913,6 +1909,11 @@ let _ =
     () ;
   error Api_errors.invalid_base_url ["url"]
     ~doc:"The base url in the repository is invalid." () ;
+  error Api_errors.blocked_repo_url ["url"]
+    ~doc:
+      "Cannot create the repository as the url is blocked, please check your \
+       settings."
+    () ;
   error Api_errors.invalid_gpgkey_path ["gpgkey_path"]
     ~doc:"The GPG public key file name in the repository is invalid." () ;
   error Api_errors.repository_already_exists ["ref"]
@@ -2028,6 +2029,27 @@ let _ =
 
   error Api_errors.too_many_groups [] ~doc:"VM can only belong to one group." () ;
 
+  error Api_errors.enable_ssh_failed ["host"]
+    ~doc:"Failed to enable SSH access." () ;
+
+  error Api_errors.disable_ssh_failed ["host"]
+    ~doc:"Failed to disable SSH access." () ;
+
+  error Api_errors.enable_ssh_partially_failed ["hosts"]
+    ~doc:"Some of hosts failed to enable SSH access." () ;
+
+  error Api_errors.disable_ssh_partially_failed ["hosts"]
+    ~doc:"Some of hosts failed to disable SSH access." () ;
+
+  error Api_errors.set_ssh_timeout_partially_failed ["hosts"]
+    ~doc:"Some hosts failed to set SSH timeout." () ;
+
+  error Api_errors.set_console_timeout_partially_failed ["hosts"]
+    ~doc:"Some hosts failed to set console timeout." () ;
+
+  error Api_errors.set_ssh_auto_mode_partially_failed ["hosts"]
+    ~doc:"Some hosts failed to set SSH auto mode." () ;
+
   error Api_errors.host_driver_no_hardware ["driver variant"]
     ~doc:"No hardware present for this host driver variant" () ;
 
@@ -2036,6 +2058,9 @@ let _ =
       "TLS verification has not been enabled in the pool successfully, please \
        enable it in XC or run xe pool-enable-tls-verification instead."
     () ;
+
+  error Api_errors.sysprep ["vm"; "message"]
+    ~doc:"VM.sysprep error with details in the message" () ;
 
   message
     (fst Api_messages.ha_pool_overcommitted)

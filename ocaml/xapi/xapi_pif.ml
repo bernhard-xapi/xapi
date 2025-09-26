@@ -271,13 +271,17 @@ let abort_if_network_attached_to_protected_vms ~__context ~self =
     List.iter
       (fun vm ->
         if Helpers.is_xha_protected ~__context ~self:vm then (
-          warn
-            "PIF.unplug will make protected VM %s not agile since it has a VIF \
-             attached to network %s"
-            (Ref.string_of vm) (Ref.string_of net) ;
+          let vm = Ref.string_of vm in
+          let pif = Ref.string_of self in
+          let net = Ref.string_of net in
+          info
+            "The protected VM %s must remain agile and blocked the operation. \
+             PIF %s must be plugged this. This happened because network %s is \
+             used by both the VM and the PIF"
+            vm pif net ;
           raise
-            (Api_errors.Server_error
-               (Api_errors.ha_operation_would_break_failover_plan, [])
+            Api_errors.(
+              Server_error (ha_constraint_violation_network_not_shared, [net])
             )
         )
       )
@@ -926,17 +930,25 @@ let assert_cluster_host_operation_not_in_progress ~__context =
   match Db.Cluster.get_all ~__context with
   | [] ->
       ()
-  | cluster :: _ ->
-      let ops =
-        Db.Cluster.get_current_operations ~__context ~self:cluster
-        |> List.map snd
-      in
-      if List.mem `enable ops || List.mem `add ops then
-        raise
-          Api_errors.(
-            Server_error
-              (other_operation_in_progress, ["Cluster"; Ref.string_of cluster])
-          )
+  | cluster :: _ -> (
+      let ops = Db.Cluster.get_current_operations ~__context ~self:cluster in
+      match List.find_opt (fun (_, op) -> op = `enable || op = `add) ops with
+      | Some (op_ref, op_type) ->
+          raise
+            Api_errors.(
+              Server_error
+                ( other_operation_in_progress
+                , [
+                    "Cluster"
+                  ; Ref.string_of cluster
+                  ; API.cluster_operation_to_string op_type
+                  ; op_ref
+                  ]
+                )
+            )
+      | None ->
+          ()
+    )
 
 (* Block allowing unplug if
    - a cluster host is enabled on this PIF
@@ -1126,7 +1138,7 @@ let start_of_day_best_effort_bring_up ~__context () =
   debug "Configured network backend: %s"
     (Network_interface.string_of_kind (Net.Bridge.get_kind dbg ())) ;
   (* Clear the state of the network daemon, before refreshing it by plugging
-     * the most important PIFs (see above). *)
+   * the most important PIFs (see above). *)
   Net.clear_state () ;
   List.iter
     (fun (pif, pifr) ->

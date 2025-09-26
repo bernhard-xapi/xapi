@@ -29,6 +29,8 @@ let default_sockets_dir = "/var/lib/xcp"
 
 let daemon_name = "xcp-rrdd"
 
+let max_supported_vms = 1024
+
 let default_path = ref (Filename.concat default_sockets_dir daemon_name)
 
 let forwarded_path =
@@ -409,18 +411,6 @@ module RPC_API (R : RPC) = struct
       ; "alongside the standard archive of average values"
       ]
       (value_p @-> returning unit_p rrd_err)
-
-  let update_vm_memory_target =
-    let target_p =
-      Param.mk ~name:"target" ~description:["VM memory target"] Types.int64
-    in
-    declare "update_vm_memory_target"
-      [
-        "Sets the `memory_target` value for a VM. This is called by xapi when \
-         it is told by"
-      ; "xenopsd that squeezed has changed the target for a VM."
-      ]
-      (domid_p @-> target_p @-> returning unit_p rrd_err)
 
   let set_cache_sr =
     declare "set_cache_sr"

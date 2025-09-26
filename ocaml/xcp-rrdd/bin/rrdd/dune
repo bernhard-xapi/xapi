@@ -10,8 +10,8 @@
     http_lib
     httpsvr
     inotify
-    mtime
-    mtime.clock.os
+    clock
+    mtime.clock
     rpclib.core
     rrd-transport
     rrd-transport.lib
@@ -41,15 +41,16 @@
   (libraries
     astring
     ezxenstore.core
-    ezxenstore.watch
     forkexec
     http_lib
     httpsvr
     inotify
+    clock
     rpclib.core
     rpclib.json
     rpclib.xml
     rrdd_libs_internal
+    rrdd_plugin_xenctrl
     rrd-transport
     threads.posix
     uuid
@@ -65,9 +66,6 @@
     xapi-stdext-threads
     xapi-stdext-unix
     xenctrl
-    xenstore
-    xenstore.unix
-    xenstore_transport.unix
   )
 )
 

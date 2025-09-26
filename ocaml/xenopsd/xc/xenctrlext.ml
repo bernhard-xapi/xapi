@@ -90,6 +90,9 @@ external domain_soft_reset : handle -> domid -> unit
 external domain_update_channels : handle -> domid -> int -> int -> unit
   = "stub_xenctrlext_domain_update_channels"
 
+external vcpu_setaffinity_hard : handle -> domid -> int -> bool array -> unit
+  = "stub_xenctrlext_vcpu_setaffinity_hard"
+
 external vcpu_setaffinity_soft : handle -> domid -> int -> bool array -> unit
   = "stub_xenctrlext_vcpu_setaffinity_soft"
 
@@ -109,5 +112,22 @@ external combine_cpu_policies : int64 array -> int64 array -> int64 array
 external policy_is_compatible : int64 array -> int64 array -> string option
   = "stub_xenctrlext_featuresets_are_compatible"
 
-external domain_claim_pages : handle -> domid -> int -> unit
+external stub_domain_claim_pages : handle -> domid -> int -> int -> unit
   = "stub_xenctrlext_domain_claim_pages"
+
+module NumaNode = struct
+  type t = int
+
+  (** Defined as XC_NUMA_NO_NODE in xen.git/tools/include/xenguest.h, it's an
+      unsigned int (~0U) *)
+  let none = 0xFFFFFFFF
+
+  let from = Fun.id
+end
+
+exception Not_available
+
+let domain_claim_pages handle domid ?(numa_node = NumaNode.none) nr_pages =
+  if numa_node <> NumaNode.none then
+    raise Not_available ;
+  stub_domain_claim_pages handle domid numa_node nr_pages

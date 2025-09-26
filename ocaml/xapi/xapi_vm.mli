@@ -32,8 +32,6 @@ val retrieve_wlb_recommendations :
 
 val assert_agile : __context:Context.t -> self:[`VM] Ref.t -> unit
 
-val immediate_complete : __context:Context.t -> unit
-
 val set_actions_after_crash :
      __context:Context.t
   -> self:[`VM] Ref.t
@@ -401,6 +399,14 @@ val call_plugin :
   -> args:(string * string) list
   -> string
 
+val call_host_plugin :
+     __context:Context.t
+  -> vm:API.ref_VM
+  -> plugin:string
+  -> fn:string
+  -> args:(string * string) list
+  -> string
+
 val set_has_vendor_device :
   __context:Context.t -> self:API.ref_VM -> value:bool -> unit
 
@@ -444,3 +450,10 @@ val add_to_blocked_operations :
 
 val remove_from_blocked_operations :
   __context:Context.t -> self:API.ref_VM -> key:API.vm_operations -> unit
+
+val sysprep :
+     __context:Context.t
+  -> self:API.ref_VM
+  -> unattend:SecretString.t
+  -> timeout:float
+  -> unit

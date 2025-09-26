@@ -48,9 +48,13 @@ module type ObserverInterface = sig
 
   val set_export_interval : __context:Context.t -> interval:float -> unit
 
+  val set_export_chunk_size : __context:Context.t -> size:int -> unit
+
   val set_max_spans : __context:Context.t -> spans:int -> unit
 
   val set_max_traces : __context:Context.t -> traces:int -> unit
+
+  val set_max_depth : __context:Context.t -> depth:int -> unit
 
   val set_max_file_size : __context:Context.t -> file_size:int -> unit
 
@@ -61,56 +65,64 @@ end
 
 module Observer : ObserverInterface = struct
   let create ~__context ~uuid ~name_label ~attributes ~endpoints ~enabled =
-    debug "Observer.create %s" uuid ;
+    debug "xapi Observer.create %s" uuid ;
     Tracing.TracerProvider.create ~uuid ~name_label ~attributes ~endpoints
       ~enabled
 
   let destroy ~__context ~uuid =
-    debug "Observer.destroy %s" uuid ;
+    debug "xapi Observer.destroy %s" uuid ;
     Tracing.TracerProvider.destroy ~uuid
 
   let set_enabled ~__context ~uuid ~enabled =
-    debug "Observer.set_enabled %s" uuid ;
+    debug "xapi Observer.set_enabled %s" uuid ;
     Tracing.TracerProvider.set ~uuid ~enabled ()
 
   let set_attributes ~__context ~uuid ~attributes =
-    debug "Observer.set_attributes %s" uuid ;
+    debug "xapi Observer.set_attributes %s" uuid ;
     Tracing.TracerProvider.set ~uuid ~attributes ()
 
   let set_endpoints ~__context ~uuid ~endpoints =
-    debug "Observer.set_endpoints %s" uuid ;
+    debug "xapi Observer.set_endpoints %s" uuid ;
     Tracing.TracerProvider.set ~uuid ~endpoints ()
 
   let init ~__context =
-    debug "Observer.init" ;
+    debug "xapi Observer.init" ;
     ignore @@ Tracing_export.main ()
 
   let set_trace_log_dir ~__context ~dir =
-    debug "Observer.set_trace_log_dir" ;
+    debug "xapi Observer.set_trace_log_dir" ;
     Tracing_export.Destination.File.set_trace_log_dir dir
 
   let set_export_interval ~__context ~interval =
-    debug "Observer.set_export_interval" ;
+    debug "xapi Observer.set_export_interval" ;
     Tracing_export.set_export_interval interval
 
+  let set_export_chunk_size ~__context ~size =
+    debug "xapi Observer.set_export_chunk_size" ;
+    Tracing_export.set_export_chunk_size size
+
   let set_max_spans ~__context ~spans =
-    debug "Observer.set_max_spans" ;
+    debug "xapi Observer.set_max_spans" ;
     Tracing.Spans.set_max_spans spans
 
   let set_max_traces ~__context ~traces =
-    debug "Observer.set_max_traces" ;
+    debug "xapi Observer.set_max_traces" ;
     Tracing.Spans.set_max_traces traces
 
+  let set_max_depth ~__context ~depth =
+    debug "xapi Observer.set_max_depth" ;
+    Tracing.Spans.set_max_depth depth
+
   let set_max_file_size ~__context ~file_size =
-    debug "Observer.set_max_file_size" ;
+    debug "xapi Observer.set_max_file_size" ;
     Tracing_export.Destination.File.set_max_file_size file_size
 
   let set_host_id ~__context ~host_id =
-    debug "Observer.set_host_id" ;
+    debug "xapi Observer.set_host_id" ;
     Tracing_export.set_host_id host_id
 
   let set_compress_tracing_files ~__context ~enabled =
-    debug "Observer.set_compress_tracing_files" ;
+    debug "xapi Observer.set_compress_tracing_files" ;
     Tracing_export.Destination.File.set_compress_tracing_files enabled
 end
 
@@ -142,79 +154,91 @@ module Xapi_cluster = struct
 
   module Observer = struct
     let create ~__context ~uuid ~name_label ~attributes ~endpoints ~enabled =
-      debug "Observer.create %s" uuid ;
+      debug "xapi_cluster Observer.create %s" uuid ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.create dbg uuid name_label attributes endpoints enabled
 
     let destroy ~__context ~uuid =
-      debug "Observer.destroy %s" uuid ;
+      debug "xapi_cluster Observer.destroy %s" uuid ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.destroy dbg uuid
 
     let set_enabled ~__context ~uuid ~enabled =
-      debug "Observer.set_enabled %s" uuid ;
+      debug "xapi_cluster Observer.set_enabled %s" uuid ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_enabled dbg uuid enabled
 
     let set_attributes ~__context ~uuid ~attributes =
-      debug "Observer.set_attributes %s" uuid ;
+      debug "xapi_cluster Observer.set_attributes %s" uuid ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_attributes dbg uuid attributes
 
     let set_endpoints ~__context ~uuid ~endpoints =
-      debug "Observer.set_endpoints %s" uuid ;
+      debug "xapi_cluster Observer.set_endpoints %s" uuid ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_endpoints dbg uuid endpoints
 
     let init ~__context =
-      debug "Observer.init" ;
+      debug "xapi_cluster Observer.init" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.init dbg
 
     let set_trace_log_dir ~__context ~dir =
-      debug "Observer.set_trace_log_dir" ;
+      debug "xapi_cluster Observer.set_trace_log_dir" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_trace_log_dir dbg dir
 
     let set_export_interval ~__context ~interval =
-      debug "Observer.set_export_interval" ;
+      debug "xapi_cluster Observer.set_export_interval" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_export_interval dbg interval
 
+    let set_export_chunk_size ~__context ~size =
+      debug "xapi_cluster Observer.set_export_chunk_size" ;
+      let module S = (val local_client ~__context : XAPI_CLUSTER) in
+      let dbg = Context.string_of_task __context in
+      S.Observer.set_export_chunk_size dbg size
+
     let set_max_spans ~__context ~spans =
-      debug "Observer.set_max_spans" ;
+      debug "xapi_cluster Observer.set_max_spans" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_max_spans dbg spans
 
     let set_max_traces ~__context ~traces =
-      debug "Observer.set_max_traces" ;
+      debug "xapi_cluster Observer.set_max_traces" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_max_traces dbg traces
 
+    let set_max_depth ~__context ~depth =
+      debug "xapi_cluster Observer.set_max_depth" ;
+      let module S = (val local_client ~__context : XAPI_CLUSTER) in
+      let dbg = Context.string_of_task __context in
+      S.Observer.set_max_depth dbg depth
+
     let set_max_file_size ~__context ~file_size =
-      debug "Observer.set_max_file_size" ;
+      debug "xapi_cluster Observer.set_max_file_size" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_max_file_size dbg file_size
 
     let set_host_id ~__context ~host_id =
-      debug "Observer.set_host_id" ;
+      debug "xapi_cluster Observer.set_host_id" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_host_id dbg host_id
 
     let set_compress_tracing_files ~__context ~enabled =
-      debug "Observer.set_compress_tracing_files" ;
+      debug "xapi_cluster Observer.set_compress_tracing_files" ;
       let module S = (val local_client ~__context : XAPI_CLUSTER) in
       let dbg = Context.string_of_task __context in
       S.Observer.set_compress_tracing_files dbg enabled
@@ -331,36 +355,52 @@ module Dom0ObserverConfig (ObserverComponent : OBSERVER_COMPONENT) :
 
   let create ~__context ~uuid ~name_label:_ ~attributes:_ ~endpoints:_
       ~enabled:_ =
+    debug "%s config Observer.create" (to_string ObserverComponent.component) ;
     let observer = Db.Observer.get_by_uuid ~__context ~uuid in
     update_config ~__context ~observer ~uuid
 
-  let destroy ~__context ~uuid = remove_config ~uuid
+  let destroy ~__context ~uuid =
+    debug "%s config Observer.destroy" (to_string ObserverComponent.component) ;
+    remove_config ~uuid
 
   let set_enabled ~__context ~uuid ~enabled:_ =
+    debug "%s config Observer.set_enabled"
+      (to_string ObserverComponent.component) ;
     let observer = Db.Observer.get_by_uuid ~__context ~uuid in
     update_config ~__context ~observer ~uuid
 
   let set_attributes ~__context ~uuid ~attributes:_ =
+    debug "%s config Observer.set_attributes"
+      (to_string ObserverComponent.component) ;
     let observer = Db.Observer.get_by_uuid ~__context ~uuid in
     update_config ~__context ~observer ~uuid
 
   let set_endpoints ~__context ~uuid ~endpoints:_ =
+    debug "%s config Observer.set_endpoints"
+      (to_string ObserverComponent.component) ;
     let observer = Db.Observer.get_by_uuid ~__context ~uuid in
     update_config ~__context ~observer ~uuid
 
   let init ~__context =
+    debug "%s config Observer.init" (to_string ObserverComponent.component) ;
     let observer_all = Db.Observer.get_all ~__context in
     update_all_configs ~__context ~observer_all
 
   let set_trace_log_dir ~__context ~dir:_ =
+    debug "%s config Observer.set_trace_log_dir"
+      (to_string ObserverComponent.component) ;
     let observer_all = Db.Observer.get_all ~__context in
     update_all_configs ~__context ~observer_all
 
   let set_export_interval ~__context:_ ~interval:_ = ()
 
+  let set_export_chunk_size ~__context:_ ~size:_ = ()
+
   let set_max_spans ~__context:_ ~spans:_ = ()
 
   let set_max_traces ~__context:_ ~traces:_ = ()
+
+  let set_max_depth ~__context:_ ~depth:_ = ()
 
   let set_max_file_size ~__context:_ ~file_size:_ = ()
 
@@ -370,6 +410,30 @@ module Dom0ObserverConfig (ObserverComponent : OBSERVER_COMPONENT) :
 end
 
 module SMObserverConfig = Dom0ObserverConfig (struct let component = SMApi end)
+
+module SMObserver = struct
+  include SMObserverConfig
+  open Observer_helpers
+
+  let create ~__context ~uuid ~name_label ~attributes ~endpoints ~enabled =
+    debug "SMObserver Observer.create %s" uuid ;
+    SMObserverConfig.create ~__context ~uuid ~name_label ~attributes ~endpoints
+      ~enabled ;
+    let dbg = Context.string_of_task __context in
+    Client.create dbg uuid name_label attributes endpoints enabled
+
+  let destroy ~__context ~uuid =
+    debug "SMObserver Observer.destroy %s" uuid ;
+    SMObserverConfig.destroy ~__context ~uuid ;
+    let dbg = Context.string_of_task __context in
+    Client.destroy dbg uuid
+
+  let set_enabled ~__context ~uuid ~enabled =
+    debug "SMObserver Observer.set_enabled %s" uuid ;
+    SMObserverConfig.set_enabled ~__context ~uuid ~enabled ;
+    let dbg = Context.string_of_task __context in
+    Client.set_enabled dbg uuid enabled
+end
 
 let get_forwarder c =
   let module Forwarder =
@@ -381,7 +445,7 @@ let get_forwarder c =
           | Xapi_clusterd ->
               (module Xapi_cluster.Observer)
           | SMApi ->
-              (module SMObserverConfig)
+              (module SMObserver)
         : ObserverInterface
       )
   in
@@ -506,6 +570,10 @@ let set_export_interval ~__context interval component =
   let module Forwarder = (val get_forwarder component : ObserverInterface) in
   Forwarder.set_export_interval ~__context ~interval
 
+let set_export_chunk_size ~__context size component =
+  let module Forwarder = (val get_forwarder component : ObserverInterface) in
+  Forwarder.set_export_chunk_size ~__context ~size
+
 let set_max_spans ~__context spans component =
   let module Forwarder = (val get_forwarder component : ObserverInterface) in
   Forwarder.set_max_spans ~__context ~spans
@@ -513,6 +581,10 @@ let set_max_spans ~__context spans component =
 let set_max_traces ~__context traces component =
   let module Forwarder = (val get_forwarder component : ObserverInterface) in
   Forwarder.set_max_traces ~__context ~traces
+
+let set_max_depth ~__context depth component =
+  let module Forwarder = (val get_forwarder component : ObserverInterface) in
+  Forwarder.set_max_depth ~__context ~depth
 
 let set_max_file_size ~__context file_size component =
   let module Forwarder = (val get_forwarder component : ObserverInterface) in
@@ -549,8 +621,10 @@ let initialise_observer_component ~__context component =
 let initialise_observer_meta ~__context component =
   set_trace_log_dir ~__context !Xapi_globs.trace_log_dir component ;
   set_export_interval ~__context !Xapi_globs.export_interval component ;
+  set_export_chunk_size ~__context !Xapi_globs.export_chunk_size component ;
   set_max_spans ~__context !Xapi_globs.max_spans component ;
   set_max_traces ~__context !Xapi_globs.max_traces component ;
+  set_max_depth ~__context !Xapi_globs.max_span_depth component ;
   set_max_file_size ~__context !Xapi_globs.max_observer_file_size component ;
   set_host_id ~__context (Helpers.get_localhost_uuid ()) component ;
   set_compress_tracing_files ~__context
@@ -571,6 +645,14 @@ let initialise ~__context =
          |> observed_components_of
          |> List.iter (initialise_observer_component ~__context)
      ) ;
+  (* If SMApi is now experimental, manually remove the config as there is no observer to do it *)
+  if
+    Xapi_globs.(
+      StringSet.mem (to_string SMApi) !observer_experimental_components
+    )
+  then
+    Xapi_stdext_unix.Unixext.rm_rec (dir_name_of_component SMApi) ;
+
   Tracing_export.set_service_name "xapi"
 
 let set_hosts ~__context ~self ~value =

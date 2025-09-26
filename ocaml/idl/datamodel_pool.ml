@@ -1249,7 +1249,15 @@ let remove_repository =
 
 let sync_updates =
   call ~name:"sync_updates"
-    ~lifecycle:[(Published, "1.329.0", "")]
+    ~lifecycle:
+      [
+        (Published, "1.329.0", "")
+      ; ( Changed
+        , "25.7.0"
+        , "Added --username --password options to allow syncing updates from a \
+           remote_pool type repository"
+        )
+      ]
     ~doc:"Sync with the enabled repository"
     ~versioned_params:
       [
@@ -1286,14 +1294,14 @@ let sync_updates =
           param_type= String
         ; param_name= "username"
         ; param_doc= "The username of the remote pool"
-        ; param_release= numbered_release "25.6.0-next"
+        ; param_release= numbered_release "25.7.0"
         ; param_default= Some (VString "")
         }
       ; {
           param_type= String
         ; param_name= "password"
         ; param_doc= "The password of the remote pool"
-        ; param_release= numbered_release "25.6.0-next"
+        ; param_release= numbered_release "25.7.0"
         ; param_default= Some (VString "")
         }
       ]
@@ -1553,6 +1561,66 @@ let get_guest_secureboot_readiness =
     ~result:(pool_guest_secureboot_readiness, "The readiness of the pool")
     ~allowed_roles:_R_POOL_OP ()
 
+let enable_ssh =
+  call ~name:"enable_ssh"
+    ~doc:
+      "Enable SSH access on all hosts in the pool. It's a helper which calls \
+       host.enable_ssh for all the hosts in the pool."
+    ~lifecycle:[]
+    ~params:[(Ref _pool, "self", "The pool")]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let disable_ssh =
+  call ~name:"disable_ssh"
+    ~doc:
+      "Disable SSH access on all hosts in the pool. It's a helper which calls \
+       host.disable_ssh for all the hosts in the pool."
+    ~lifecycle:[]
+    ~params:[(Ref _pool, "self", "The pool")]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let set_ssh_enabled_timeout =
+  call ~name:"set_ssh_enabled_timeout" ~lifecycle:[]
+    ~doc:"Set the SSH enabled timeout for all hosts in the pool"
+    ~params:
+      [
+        (Ref _pool, "self", "The pool")
+      ; ( Int
+        , "value"
+        , "The SSH enabled timeout in seconds. (0 means no timeout, max 2 days)"
+        )
+      ]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let set_console_idle_timeout =
+  call ~name:"set_console_idle_timeout" ~lifecycle:[]
+    ~doc:"Set the console idle timeout for all hosts in the pool"
+    ~params:
+      [
+        (Ref _pool, "self", "The pool")
+      ; ( Int
+        , "value"
+        , "The idle SSH/VNC session timeout in seconds. A value of 0 means no \
+           timeout."
+        )
+      ]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let set_ssh_auto_mode =
+  call ~name:"set_ssh_auto_mode" ~lifecycle:[]
+    ~doc:"Set the SSH auto mode for all hosts in the pool"
+    ~params:
+      [
+        (Ref _pool, "self", "The pool")
+      ; ( Bool
+        , "value"
+        , "The SSH auto mode for all hosts in the pool，when set to true, SSH \
+           to normally be disabled and SSH to be enabled only in case of \
+           emergency e.g., xapi is down"
+        )
+      ]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
 (** A pool class *)
 let t =
   create_obj ~in_db:true
@@ -1647,6 +1715,11 @@ let t =
       ; set_ext_auth_cache_size
       ; set_ext_auth_cache_expiry
       ; get_guest_secureboot_readiness
+      ; enable_ssh
+      ; disable_ssh
+      ; set_ssh_enabled_timeout
+      ; set_console_idle_timeout
+      ; set_ssh_auto_mode
       ]
     ~contents:
       ([
@@ -2171,6 +2244,12 @@ let t =
             ~ty:(Map (String, String))
             ~default_value:(Some (VMap [])) "license_server"
             "Licensing data shared within the whole pool"
+        ; field ~writer_roles:_R_POOL_OP ~qualifier:RW ~lifecycle:[] ~ty:Bool
+            ~default_value:(Some (VBool true))
+            "ha_reboot_vm_on_internal_shutdown"
+            "Indicates whether an HA-protected VM that is shut down from \
+             inside (not through the API) should be automatically rebooted \
+             when HA is enabled"
         ]
       )
     ()

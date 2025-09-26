@@ -113,6 +113,8 @@ let host_disabled = add_error "HOST_DISABLED"
 
 let host_disabled_until_reboot = add_error "HOST_DISABLED_UNTIL_REBOOT"
 
+let host_disabled_indefinitely = add_error "HOST_DISABLED_INDEFINITELY"
+
 let host_not_disabled = add_error "HOST_NOT_DISABLED"
 
 let host_not_live = add_error "HOST_NOT_LIVE"
@@ -440,14 +442,7 @@ let vm_old_pv_drivers = add_error "VM_OLD_PV_DRIVERS"
 
 let vm_lacks_feature = add_error "VM_LACKS_FEATURE"
 
-let vm_lacks_feature_shutdown = add_error "VM_LACKS_FEATURE_SHUTDOWN"
-
-let vm_lacks_feature_suspend = add_error "VM_LACKS_FEATURE_SUSPEND"
-
-let vm_lacks_feature_vcpu_hotplug = add_error "VM_LACKS_FEATURE_VCPU_HOTPLUG"
-
-let vm_lacks_feature_static_ip_setting =
-  add_error "VM_LACKS_FEATURE_STATIC_IP_SETTING"
+let vm_non_suspendable = add_error "VM_NON_SUSPENDABLE"
 
 let vm_cannot_delete_default_template =
   add_error "VM_CANNOT_DELETE_DEFAULT_TEMPLATE"
@@ -756,6 +751,12 @@ let pool_joining_host_ca_certificates_conflict =
 
 let pool_joining_sm_features_incompatible =
   add_error "POOL_JOINING_SM_FEATURES_INCOMPATIBLE"
+
+let pool_joining_pool_cannot_enable_clustering_on_vlan_network =
+  add_error "POOL_JOINING_POOL_CANNOT_ENABLE_CLUSTERING_ON_VLAN_NETWORK"
+
+let pool_joining_host_must_have_only_one_IP_on_clustering_network =
+  add_error "POOL_JOINING_HOST_MUST_HAVE_ONLY_ONE_IP_ON_CLUSTERING_NETWORK"
 
 (*workload balancing*)
 let wlb_not_initialized = add_error "WLB_NOT_INITIALIZED"
@@ -1317,6 +1318,8 @@ let configure_repositories_in_progress =
 
 let invalid_base_url = add_error "INVALID_BASE_URL"
 
+let blocked_repo_url = add_error "BLOCKED_REPO_URL"
+
 let invalid_gpgkey_path = add_error "INVALID_GPGKEY_PATH"
 
 let repository_already_exists = add_error "REPOSITORY_ALREADY_EXISTS"
@@ -1412,7 +1415,26 @@ let illegal_in_fips_mode = add_error "ILLEGAL_IN_FIPS_MODE"
 
 let too_many_groups = add_error "TOO_MANY_GROUPS"
 
+let enable_ssh_failed = add_error "ENABLE_SSH_FAILED"
+
+let disable_ssh_failed = add_error "DISABLE_SSH_FAILED"
+
+let enable_ssh_partially_failed = add_error "ENABLE_SSH_PARTIALLY_FAILED"
+
+let disable_ssh_partially_failed = add_error "DISABLE_SSH_PARTIALLY_FAILED"
+
+let set_ssh_timeout_partially_failed =
+  add_error "SET_SSH_TIMEOUT_PARTIALLY_FAILED"
+
+let set_console_timeout_partially_failed =
+  add_error "SET_CONSOLE_TIMEOUT_PARTIALLY_FAILED"
+
+let set_ssh_auto_mode_partially_failed =
+  add_error "SET_SSH_AUTO_MODE_PARTIALLY_FAILED"
+
 let host_driver_no_hardware = add_error "HOST_DRIVER_NO_HARDWARE"
 
 let tls_verification_not_enabled_in_pool =
   add_error "TLS_VERIFICATION_NOT_ENABLED_IN_POOL"
+
+let sysprep = add_error "SYSPREP"

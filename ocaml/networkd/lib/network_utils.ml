@@ -51,8 +51,6 @@ let ovs_ofctl = "/usr/bin/ovs-ofctl"
 
 let ovs_appctl = "/usr/bin/ovs-appctl"
 
-let ovs_vlan_bug_workaround = "/usr/sbin/ovs-vlan-bug-workaround"
-
 let brctl = ref "/sbin/brctl"
 
 let modprobe = "/sbin/modprobe"
@@ -162,7 +160,8 @@ module Sysfs = struct
     with
     | End_of_file ->
         ""
-    | Unix.Unix_error (Unix.EINVAL, _, _) ->
+    | Unix.Unix_error (Unix.EINVAL, _, _) | Unix.Unix_error (Unix.ENOENT, _, _)
+      ->
         (* The device is not yet up *)
         raise (Network_error (Read_error file))
     | exn ->
@@ -180,17 +179,28 @@ module Sysfs = struct
       close_out outchan ;
       raise (Network_error (Write_error file))
 
-  let is_physical name =
+  exception Unable_to_read_driver_link
+
+  let is_vif name =
+    let devpath = getpath name "device" in
     try
-      let devpath = getpath name "device" in
       let driver_link = Unix.readlink (devpath ^ "/driver") in
       (* filter out symlinks under device/driver which look like
          /../../../devices/xen-backend/vif- *)
-      not
-        (List.mem "xen-backend"
-           (Astring.String.cuts ~empty:false ~sep:"/" driver_link)
-        )
+      List.mem "xen-backend"
+        (Astring.String.cuts ~empty:false ~sep:"/" driver_link)
+    with _ -> raise Unable_to_read_driver_link
+
+  let is_vf name =
+    let devpath = getpath name "device" in
+    try
+      ignore @@ Unix.readlink (devpath ^ "/physfn") ;
+      true
     with _ -> false
+
+  let is_physical name =
+    try not (is_vif name || is_vf name)
+    with Unable_to_read_driver_link -> false
 
   (* device types are defined in linux/if_arp.h *)
   let is_ether_device name =
@@ -261,25 +271,6 @@ module Sysfs = struct
     | None ->
         Result.Error
           (Fail_to_get_driver_name, "Failed to get driver name for: " ^ dev)
-
-  (** Returns the features bitmap for the driver for [dev]. The features bitmap
-      is a set of NETIF_F_ flags supported by its driver. *)
-  let get_features dev =
-    try Some (int_of_string (read_one_line (getpath dev "features")))
-    with _ -> None
-
-  (** Returns [true] if [dev] supports VLAN acceleration, [false] otherwise. *)
-  let has_vlan_accel dev =
-    let flag_NETIF_F_HW_VLAN_TX = 128 in
-    let flag_NETIF_F_HW_VLAN_RX = 256 in
-    let flag_NETIF_F_VLAN =
-      flag_NETIF_F_HW_VLAN_TX lor flag_NETIF_F_HW_VLAN_RX
-    in
-    match get_features dev with
-    | None ->
-        false
-    | Some features ->
-        features land flag_NETIF_F_VLAN <> 0
 
   let set_multicast_snooping bridge value =
     try
@@ -1340,44 +1331,6 @@ module Ovs = struct
           )
       with _ -> warn "Failed to set max-idle=%d on OVS" t
 
-    let handle_vlan_bug_workaround override bridge =
-      (* This is a list of drivers that do support VLAN tx or rx acceleration,
-         but to which the VLAN bug workaround should not be applied. This could
-         be because these are known-good drivers (that is, they do not have any
-         of the bugs that the workaround avoids) or because the VLAN bug
-         workaround will not work for them and may cause other problems.
-
-         This is a very short list because few drivers have been tested. *)
-      let no_vlan_workaround_drivers = ["bonding"] in
-      let phy_interfaces =
-        try
-          let interfaces = bridge_to_interfaces bridge in
-          List.filter Sysfs.is_physical interfaces
-        with _ -> []
-      in
-      List.iter
-        (fun interface ->
-          let do_workaround =
-            match override with
-            | Some value ->
-                value
-            | None -> (
-              match Sysfs.get_driver_name interface with
-              | None ->
-                  Sysfs.has_vlan_accel interface
-              | Some driver ->
-                  if List.mem driver no_vlan_workaround_drivers then
-                    false
-                  else
-                    Sysfs.has_vlan_accel interface
-            )
-          in
-          let setting = if do_workaround then "on" else "off" in
-          try ignore (call_script ovs_vlan_bug_workaround [interface; setting])
-          with _ -> ()
-        )
-        phy_interfaces
-
     let get_vlans name =
       try
         let vlans_with_uuid =
@@ -1474,13 +1427,12 @@ module Ovs = struct
       ["--"; "--may-exist"; "add-port"; bridge; name] @ type_args
 
     let create_bridge ?mac ?external_id ?disable_in_band ?igmp_snooping
-        ~fail_mode vlan vlan_bug_workaround name =
+        ~fail_mode vlan name =
       let vlan_arg =
         match vlan with
         | None ->
             []
         | Some (parent, tag) ->
-            handle_vlan_bug_workaround vlan_bug_workaround parent ;
             [parent; string_of_int tag]
       in
       let mac_arg =
@@ -1546,7 +1498,7 @@ module Ovs = struct
       let vif_arg =
         let existing_vifs =
           List.filter
-            (fun iface -> not (Sysfs.is_physical iface))
+            (fun iface -> try Sysfs.is_vif iface with _ -> false)
             (bridge_to_interfaces name)
         in
         let ifaces_with_type =

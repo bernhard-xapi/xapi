@@ -497,7 +497,7 @@ let has_non_allocated_vgpus ~__context ~self =
  * 4. Remove the list head from the remainding vGPU list of the VM
  * 5. Repeat step 2-4 until fail or the remainding list is empty
  * 6. Return success
- * *)
+ *)
 let assert_gpus_available ~__context ~self ~host =
   let vgpus = Db.VM.get_VGPUs ~__context ~self in
   let vGPU_structs = List.map (Vgpuops.vgpu_of_ref ~__context) vgpus in
@@ -1304,9 +1304,9 @@ let allowed_VBD_devices_HVM_floppy =
     (fun x -> Device_number.(make Floppy ~disk:x ~partition:0))
     (inclusive_range 0 1)
 
-let allowed_VIF_devices_HVM = vif_inclusive_range 0 6
+let allowed_VIF_devices_HVM = vif_inclusive_range 0 15
 
-let allowed_VIF_devices_PV = vif_inclusive_range 0 6
+let allowed_VIF_devices_PV = vif_inclusive_range 0 15
 
 (** [possible_VBD_devices_of_string s] returns a list of Device_number.t which
     	represent possible interpretations of [s]. *)
@@ -1465,6 +1465,7 @@ let copy_guest_metrics ~__context ~vm =
       ~memory:all.API.vM_guest_metrics_memory
       ~disks:all.API.vM_guest_metrics_disks
       ~networks:all.API.vM_guest_metrics_networks
+      ~services:all.API.vM_guest_metrics_services
       ~pV_drivers_detected:all.API.vM_guest_metrics_PV_drivers_detected
       ~other:all.API.vM_guest_metrics_other
       ~last_updated:all.API.vM_guest_metrics_last_updated
@@ -1671,8 +1672,10 @@ let ensure_device_model_profile_present ~__context ~domain_type ~is_a_template
   let trad = Vm_platform.(device_model, fallback_device_model_stage_1) in
   if is_a_template then
     platform
-  else if (not needs_qemu) || List.mem_assoc Vm_platform.device_model platform
-  then (* upgrade existing Device Model entry *)
+  else if
+    (not needs_qemu) || List.mem_assoc Vm_platform.device_model platform
+    (* upgrade existing Device Model entry *)
+  then
     platform |> List.map (fun entry -> if entry = trad then default else entry)
   else
     (* only add device-model to an HVM VM platform if it is not already there *)

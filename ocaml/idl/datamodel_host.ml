@@ -625,12 +625,37 @@ let disable =
         , "Puts the host into a state in which no new VMs can be started. \
            Currently active VMs on the host continue to execute."
         )
+      ; ( Changed
+        , "25.31.0"
+        , "Added auto_enable option to allow persisting the state across \
+           toolstack restarts and host reboots."
+        )
       ]
     ~name:"disable"
     ~doc:
       "Puts the host into a state in which no new VMs can be started. \
        Currently active VMs on the host continue to execute."
-    ~params:[(Ref _host, "host", "The Host to disable")]
+    ~versioned_params:
+      [
+        {
+          param_type= Ref _host
+        ; param_name= "host"
+        ; param_doc= "The Host to disable"
+        ; param_release= rio_release
+        ; param_default= None
+        }
+      ; {
+          param_type= Bool
+        ; param_name= "auto_enable"
+        ; param_doc=
+            "If true (default), the host will be re-enabled after a toolstack \
+             restart automatically. If false, the host will be disabled \
+             indefinitely, across toolstack restarts and host reboots, until \
+             re-enabled explicitly with Host.enable."
+        ; param_release= numbered_release "25.31.0"
+        ; param_default= Some (VBool true)
+        }
+      ]
     ~allowed_roles:(_R_POOL_OP ++ _R_CLIENT_CERT)
     ()
 
@@ -1297,14 +1322,70 @@ let create_params =
     ; param_doc=
         "The SHA256 checksum of updateinfo of the most recently applied update \
          on the host"
-    ; param_release= numbered_release "24.39.0-next"
+    ; param_release= numbered_release "24.40.0"
     ; param_default= Some (VString "")
+    }
+  ; {
+      param_type= Bool
+    ; param_name= "ssh_enabled"
+    ; param_doc= "True if SSH access is enabled for the host"
+    ; param_release= numbered_release "25.21.0"
+    ; param_default= Some (VBool Constants.default_ssh_enabled)
+    }
+  ; {
+      param_type= Int
+    ; param_name= "ssh_enabled_timeout"
+    ; param_doc=
+        "The timeout in seconds after which SSH access will be automatically \
+         disabled (0 means never), this setting will be applied every time the \
+         SSH is enabled by XAPI"
+    ; param_release= numbered_release "25.21.0"
+    ; param_default= Some (VInt Constants.default_ssh_enabled_timeout)
+    }
+  ; {
+      param_type= DateTime
+    ; param_name= "ssh_expiry"
+    ; param_doc=
+        "The time in UTC after which the SSH access will be automatically \
+         disabled"
+    ; param_release= numbered_release "25.21.0"
+    ; param_default= Some (VDateTime Date.epoch)
+    }
+  ; {
+      param_type= Int
+    ; param_name= "console_idle_timeout"
+    ; param_doc=
+        "The timeout in seconds after which idle console will be automatically \
+         terminated (0 means never)"
+    ; param_release= numbered_release "25.21.0"
+    ; param_default= Some (VInt Constants.default_console_idle_timeout)
+    }
+  ; {
+      param_type= Bool
+    ; param_name= "ssh_auto_mode"
+    ; param_doc= "True if SSH auto mode is enabled for the host"
+    ; param_release= numbered_release "25.27.0"
+    ; param_default= Some (VBool Constants.default_ssh_auto_mode)
     }
   ]
 
 let create =
   call ~name:"create" ~in_oss_since:None
-    ~lifecycle:[(Published, rel_rio, "Create a new host record")]
+    ~lifecycle:
+      [
+        (Published, rel_rio, "Create a new host record")
+      ; ( Changed
+        , "24.40.0"
+        , "Added --last_update_hash option to allow last_update_hash to be \
+           kept for host joined a pool"
+        )
+      ; ( Changed
+        , "25.21.0"
+        , "Added --ssh_enabled --ssh_enabled_timeout --ssh_expiry \
+           --console_idle_timeout --ssh_auto_mode options to allow them to be \
+           configured for new host"
+        )
+      ]
     ~versioned_params:create_params ~doc:"Create a new host record"
     ~result:(Ref _host, "Reference to the newly created host object.")
     ~hide_from_docs:true ~allowed_roles:_R_POOL_OP ()
@@ -2346,6 +2427,66 @@ let emergency_clear_mandatory_guidance =
     ~doc:"Clear the pending mandatory guidance on this host"
     ~allowed_roles:_R_LOCAL_ROOT_ONLY ()
 
+let enable_ssh =
+  call ~name:"enable_ssh"
+    ~doc:
+      "Enable SSH access on the host. It will start the service sshd only if \
+       it is not running. It will also enable the service sshd only if it is \
+       not enabled. A newly joined host in the pool or an ejected host from \
+       the pool would keep the original status."
+    ~lifecycle:[]
+    ~params:[(Ref _host, "self", "The host")]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let disable_ssh =
+  call ~name:"disable_ssh"
+    ~doc:
+      "Disable SSH access on the host. It will stop the service sshd only if \
+       it is running. It will also disable the service sshd only if it is \
+       enabled. A newly joined host in the pool or an ejected host from the \
+       pool would keep the original status."
+    ~lifecycle:[]
+    ~params:[(Ref _host, "self", "The host")]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let set_ssh_enabled_timeout =
+  call ~name:"set_ssh_enabled_timeout" ~lifecycle:[]
+    ~doc:"Set the SSH service enabled timeout for the host"
+    ~params:
+      [
+        (Ref _host, "self", "The host")
+      ; ( Int
+        , "value"
+        , "The SSH enabled timeout in seconds (0 means no timeout, max 2 days)"
+        )
+      ]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let set_console_idle_timeout =
+  call ~name:"set_console_idle_timeout" ~lifecycle:[]
+    ~doc:"Set the console idle timeout for the host"
+    ~params:
+      [
+        (Ref _host, "self", "The host")
+      ; (Int, "value", "The console idle timeout in seconds")
+      ]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
+let set_ssh_auto_mode =
+  call ~name:"set_ssh_auto_mode" ~lifecycle:[]
+    ~doc:"Set the SSH auto mode for the host"
+    ~params:
+      [
+        (Ref _host, "self", "The host")
+      ; ( Bool
+        , "value"
+        , "The SSH auto mode for the host，when set to true, SSH to normally be \
+           disabled and SSH to be enabled only in case of emergency e.g., xapi \
+           is down"
+        )
+      ]
+    ~allowed_roles:_R_POOL_ADMIN ()
+
 let latest_synced_updates_applied_state =
   Enum
     ( "latest_synced_updates_applied_state"
@@ -2503,6 +2644,11 @@ let t =
       ; set_https_only
       ; apply_recommended_guidances
       ; emergency_clear_mandatory_guidance
+      ; enable_ssh
+      ; disable_ssh
+      ; set_ssh_enabled_timeout
+      ; set_console_idle_timeout
+      ; set_ssh_auto_mode
       ]
     ~contents:
       ([
@@ -2940,6 +3086,28 @@ let t =
             ~default_value:(Some (VString "")) "last_update_hash"
             "The SHA256 checksum of updateinfo of the most recently applied \
              update on the host"
+        ; field ~qualifier:DynamicRO ~lifecycle:[] ~ty:Bool
+            ~default_value:(Some (VBool Constants.default_ssh_enabled))
+            "ssh_enabled" "True if SSH access is enabled for the host"
+        ; field ~qualifier:DynamicRO ~lifecycle:[] ~ty:Int
+            ~default_value:(Some (VInt Constants.default_ssh_enabled_timeout))
+            "ssh_enabled_timeout"
+            "The timeout in seconds after which SSH access will be \
+             automatically disabled (0 means never), this setting will be \
+             applied every time the SSH is enabled by XAPI"
+        ; field ~qualifier:DynamicRO ~lifecycle:[] ~ty:DateTime
+            ~default_value:(Some (VDateTime Date.epoch)) "ssh_expiry"
+            "The time in UTC after which the SSH access will be automatically \
+             disabled"
+        ; field ~qualifier:DynamicRO ~lifecycle:[] ~ty:Int
+            ~default_value:(Some (VInt Constants.default_console_idle_timeout))
+            "console_idle_timeout"
+            "The timeout in seconds after which idle console will be \
+             automatically terminated (0 means never)"
+        ; field ~qualifier:DynamicRO ~lifecycle:[] ~ty:Bool
+            ~default_value:(Some (VBool Constants.default_ssh_auto_mode))
+            "ssh_auto_mode"
+            "Reflects whether SSH auto mode is enabled for the host"
         ]
       )
     ()

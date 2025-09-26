@@ -74,7 +74,7 @@ let set_power_on_mode ~__context ~self ~power_on_mode ~power_on_config =
         + HA is enabled and this host has broken storage or networking which would cause protected VMs
         to become non-agile
 *)
-let assert_safe_to_reenable ~__context ~self =
+let assert_safe_to_reenable ~__context ~self ~user_request =
   assert_startup_complete () ;
   Repository_helpers.assert_no_host_pending_mandatory_guidance ~__context
     ~host:self ;
@@ -86,6 +86,14 @@ let assert_safe_to_reenable ~__context ~self =
     raise
       (Api_errors.Server_error
          (Api_errors.host_disabled_until_reboot, [Ref.string_of self])
+      ) ;
+  let host_auto_enable =
+    try bool_of_string (Localdb.get Constants.host_auto_enable) with _ -> true
+  in
+  if (not host_auto_enable) && not user_request then
+    raise
+      (Api_errors.Server_error
+         (Api_errors.host_disabled_indefinitely, [Ref.string_of self])
       ) ;
   if Db.Pool.get_ha_enabled ~__context ~self:(Helpers.get_pool ~__context) then (
     let pbds = Db.Host.get_PBDs ~__context ~self in
@@ -119,6 +127,8 @@ let pool_size_is_restricted ~__context =
   not (Pool_features.is_enabled ~__context Features.Pool_size)
 
 let bugreport_upload ~__context ~host:_ ~url ~options =
+  if url = "" then
+    raise Api_errors.(Server_error (invalid_value, ["url"; ""])) ;
   let proxy =
     if List.mem_assoc "http_proxy" options then
       List.assoc "http_proxy" options
@@ -285,13 +295,18 @@ let compute_evacuation_plan_no_wlb ~__context ~host ?(ignore_ha = false) () =
      	   the source host. So as long as host versions aren't decreasing,
      	   we're allowed to migrate VMs between hosts. *)
   debug "evacuating host version: %s"
-    (Helpers.version_string_of ~__context (Helpers.LocalObject host)) ;
+    (Helpers.get_software_versions ~__context (Helpers.LocalObject host)
+    |> Helpers.versions_string_of
+    ) ;
   let target_hosts =
     List.filter
       (fun target ->
         debug "host %s version: %s"
           (Db.Host.get_hostname ~__context ~self:target)
-          (Helpers.version_string_of ~__context (Helpers.LocalObject target)) ;
+          Helpers.(
+            get_software_versions ~__context (LocalObject target)
+            |> versions_string_of
+          ) ;
         Helpers.host_versions_not_decreasing ~__context
           ~host_from:(Helpers.LocalObject host)
           ~host_to:(Helpers.LocalObject target)
@@ -487,7 +502,8 @@ let compute_evacuation_plan_wlb ~__context ~self =
       if
         Db.Host.get_control_domain ~__context ~self:target_host <> v
         && Db.Host.get_uuid ~__context ~self:resident_h = target_uuid
-      then (* resident host and migration host are the same. Reject this plan *)
+        (* resident host and migration host are the same. Reject this plan *)
+      then
         raise
           (Api_errors.Server_error
              ( Api_errors.wlb_malformed_response
@@ -649,8 +665,9 @@ let evacuate ~__context ~host ~network ~evacuate_batch_size =
         raise (Api_errors.Server_error (code, params))
   in
 
-  (* execute [n] asynchronous API calls [api_fn] for [xs] and wait for them to
-     finish before executing the next batch. *)
+  (* execute [plans_length] asynchronous API calls [api_fn] for [xs] in batches
+     of [n] at a time, scheduling a new call as soon as one of the tasks from
+     the previous batch is completed *)
   let batch ~__context n api_fn xs =
     let finally = Xapi_stdext_pervasives.Pervasiveext.finally in
     let destroy = Client.Client.Task.destroy in
@@ -675,27 +692,55 @@ let evacuate ~__context ~host ~network ~evacuate_batch_size =
           fail task "unexpected status of migration task"
     in
 
-    let rec loop xs =
-      match take n xs with
-      | [], _ ->
-          ()
-      | head, tail ->
-          Helpers.call_api_functions ~__context @@ fun rpc session_id ->
-          let tasks = List.map (api_fn ~rpc ~session_id) head in
-          finally
-            (fun () ->
-              Tasks.wait_for_all ~rpc ~session_id ~tasks ;
-              List.iter assert_success tasks ;
-              let tail_length = List.length tail |> float in
-              let progress = 1.0 -. (tail_length /. plans_length) in
-              TaskHelper.set_progress ~__context progress
+    Helpers.call_api_functions ~__context @@ fun rpc session_id ->
+    ( match take n xs with
+    | [], _ ->
+        ()
+    | head, tasks_left ->
+        let tasks_left = ref tasks_left in
+        let initial_task_batch = List.map (api_fn ~rpc ~session_id) head in
+        let tasks_pending =
+          ref
+            (List.fold_left
+               (fun task_set' task -> Tasks.TaskSet.add task task_set')
+               Tasks.TaskSet.empty initial_task_batch
             )
-            (fun () ->
-              List.iter (fun self -> destroy ~rpc ~session_id ~self) tasks
-            ) ;
-          loop tail
-    in
-    loop xs ;
+        in
+
+        let single_task_progress = 1.0 /. plans_length in
+        let on_each_task_completion completed_task_count completed_task =
+          (* Clean up the completed task *)
+          assert_success completed_task ;
+          destroy ~rpc ~session_id ~self:completed_task ;
+          tasks_pending := Tasks.TaskSet.remove completed_task !tasks_pending ;
+
+          (* Update progress *)
+          let progress =
+            Int.to_float completed_task_count *. single_task_progress
+          in
+          TaskHelper.set_progress ~__context progress ;
+
+          (* Schedule a new task, if there are any left *)
+          match !tasks_left with
+          | [] ->
+              []
+          | task_to_schedule :: left ->
+              tasks_left := left ;
+              let new_task = api_fn ~rpc ~session_id task_to_schedule in
+              tasks_pending := Tasks.TaskSet.add new_task !tasks_pending ;
+              [new_task]
+        in
+        finally
+          (fun () ->
+            Tasks.wait_for_all_with_callback ~rpc ~session_id
+              ~tasks:initial_task_batch ~callback:on_each_task_completion
+          )
+          (fun () ->
+            Tasks.TaskSet.iter
+              (fun self -> destroy ~rpc ~session_id ~self)
+              !tasks_pending
+          )
+    ) ;
     TaskHelper.set_progress ~__context 1.0
   in
 
@@ -764,26 +809,29 @@ let restart_agent ~__context ~host:_ =
     )
 
 let shutdown_agent ~__context =
-  debug "Host.restart_agent: Host agent will shutdown in 1s!!!!" ;
-  let localhost = Helpers.get_localhost ~__context in
-  Xapi_hooks.xapi_pre_shutdown ~__context ~host:localhost
+  debug "Host.shutdown_agent: Host agent will shutdown in 1s!!!!" ;
+  let host_uuid = Helpers.get_localhost_uuid () in
+  Xapi_hooks.xapi_pre_shutdown ~__context ~host_uuid
     ~reason:Xapi_hooks.reason__clean_shutdown ;
   Xapi_fuse.light_fuse_and_dont_restart ~fuse_length:1. ()
 
-let disable ~__context ~host =
+let disable ~__context ~host ~auto_enable =
   if Db.Host.get_enabled ~__context ~self:host then (
     info
       "Host.enabled: setting host %s (%s) to disabled because of user request"
       (Ref.string_of host)
       (Db.Host.get_hostname ~__context ~self:host) ;
     Db.Host.set_enabled ~__context ~self:host ~value:false ;
-    Xapi_host_helpers.user_requested_host_disable := true
+    Xapi_host_helpers.user_requested_host_disable := true ;
+    if not auto_enable then
+      Localdb.put Constants.host_auto_enable "false"
   )
 
 let enable ~__context ~host =
   if not (Db.Host.get_enabled ~__context ~self:host) then (
-    assert_safe_to_reenable ~__context ~self:host ;
+    assert_safe_to_reenable ~__context ~self:host ~user_request:true ;
     Xapi_host_helpers.user_requested_host_disable := false ;
+    Localdb.put Constants.host_auto_enable "true" ;
     info "Host.enabled: setting host %s (%s) to enabled because of user request"
       (Ref.string_of host)
       (Db.Host.get_hostname ~__context ~self:host) ;
@@ -978,7 +1026,8 @@ let is_host_alive ~__context ~host =
 let create ~__context ~uuid ~name_label ~name_description:_ ~hostname ~address
     ~external_auth_type ~external_auth_service_name ~external_auth_configuration
     ~license_params ~edition ~license_server ~local_cache_sr ~chipset_info
-    ~ssl_legacy:_ ~last_software_update ~last_update_hash =
+    ~ssl_legacy:_ ~last_software_update ~last_update_hash ~ssh_enabled
+    ~ssh_enabled_timeout ~ssh_expiry ~console_idle_timeout ~ssh_auto_mode =
   (* fail-safe. We already test this on the joining host, but it's racy, so multiple concurrent
      pool-join might succeed. Note: we do it in this order to avoid a problem checking restrictions during
      the initial setup of the database *)
@@ -1042,7 +1091,8 @@ let create ~__context ~uuid ~name_label ~name_description:_ ~hostname ~address
     ~multipathing:false ~uefi_certificates:"" ~editions:[] ~pending_guidances:[]
     ~tls_verification_enabled ~last_software_update ~last_update_hash
     ~recommended_guidances:[] ~latest_synced_updates_applied:`unknown
-    ~pending_guidances_recommended:[] ~pending_guidances_full:[] ;
+    ~pending_guidances_recommended:[] ~pending_guidances_full:[] ~ssh_enabled
+    ~ssh_enabled_timeout ~ssh_expiry ~console_idle_timeout ~ssh_auto_mode ;
   (* If the host we're creating is us, make sure its set to live *)
   Db.Host_metrics.set_last_updated ~__context ~self:metrics ~value:(Date.now ()) ;
   Db.Host_metrics.set_live ~__context ~self:metrics ~value:host_is_us ;
@@ -1583,19 +1633,17 @@ let install_server_certificate ~__context ~host ~certificate ~private_key
   replace_host_certificate ~__context ~type':`host ~host write_cert_fs
 
 let _new_host_cert ~dbg ~path : X509.Certificate.t =
-  let ip_as_string, ip =
-    match Networking_info.get_management_ip_addr ~dbg with
-    | None ->
+  let name, dns_names, ips =
+    match Networking_info.get_host_certificate_subjects ~dbg with
+    | Error cause ->
+        let msg = Networking_info.management_ip_error_to_string cause in
         Helpers.internal_error ~log_err:true ~err_fun:D.error
-          "%s: failed to get management IP" __LOC__
-    | Some ip ->
-        ip
+          "%s: failed to generate certificate subjects because %s" __LOC__ msg
+    | Ok (name, dns_names, ips) ->
+        (name, dns_names, ips)
   in
-  let dns_names = Networking_info.dns_names () in
-  let cn = match dns_names with [] -> ip_as_string | dns :: _ -> dns in
-  let ips = [ip] in
   let valid_for_days = !Xapi_globs.cert_expiration_days in
-  Gencertlib.Selfcert.host ~name:cn ~dns_names ~ips ~valid_for_days path
+  Gencertlib.Selfcert.host ~name ~dns_names ~ips ~valid_for_days path
     !Xapi_globs.server_cert_group_id
 
 let reset_server_certificate ~__context ~host =
@@ -1740,7 +1788,6 @@ let enable_external_auth ~__context ~host ~config ~service_name ~auth_type =
         raise (Api_errors.Server_error (Api_errors.auth_unknown_type, [msg]))
       ) else
         (* if no auth_type is currently defined (it is an empty string), then we can set up a new one *)
-
         (* we try to use the configuration to set up the new external authentication service *)
 
         (* we persist as much set up configuration now as we can *)
@@ -2050,8 +2097,8 @@ let apply_edition_internal ~__context ~host ~edition ~additional =
         raise Api_errors.(Server_error (license_processing_error, []))
     | V6_interface.(V6_error Missing_connection_details) ->
         raise Api_errors.(Server_error (missing_connection_details, []))
-    | V6_interface.(V6_error (License_checkout_error s)) ->
-        raise Api_errors.(Server_error (license_checkout_error, [s]))
+    | V6_interface.(V6_error (License_checkout_error (code, msg))) ->
+        raise Api_errors.(Server_error (license_checkout_error, [code; msg]))
     | V6_interface.(V6_error (Internal_error e)) ->
         Helpers.internal_error "%s" e
   in
@@ -2156,19 +2203,19 @@ let reset_networking ~__context ~host =
       (Db.PIF.get_all ~__context)
   in
   let bond_is_local bond =
-    List.fold_left
-      (fun a pif -> Db.Bond.get_master ~__context ~self:bond = pif || a)
-      false local_pifs
+    List.exists
+      (fun pif -> Db.Bond.get_master ~__context ~self:bond = pif)
+      local_pifs
   in
   let vlan_is_local vlan =
-    List.fold_left
-      (fun a pif -> Db.VLAN.get_untagged_PIF ~__context ~self:vlan = pif || a)
-      false local_pifs
+    List.exists
+      (fun pif -> Db.VLAN.get_untagged_PIF ~__context ~self:vlan = pif)
+      local_pifs
   in
   let tunnel_is_local tunnel =
-    List.fold_left
-      (fun a pif -> Db.Tunnel.get_access_PIF ~__context ~self:tunnel = pif || a)
-      false local_pifs
+    List.exists
+      (fun pif -> Db.Tunnel.get_access_PIF ~__context ~self:tunnel = pif)
+      local_pifs
   in
   let bonds = List.filter bond_is_local (Db.Bond.get_all ~__context) in
   List.iter
@@ -2740,7 +2787,7 @@ let write_uefi_certificates_to_disk ~__context ~host =
     ["KEK.auth"; "db.auth"]
     |> List.iter (fun cert ->
            let log_of found =
-             (if found then info else error)
+             (if found then info else warn)
                "check_valid_uefi_certs: %s %s in %s"
                (if found then "found" else "missing")
                cert path
@@ -2792,6 +2839,7 @@ let set_uefi_certificates ~__context ~host:_ ~value:_ =
 let set_iscsi_iqn ~__context ~host ~value =
   if value = "" then
     raise Api_errors.(Server_error (invalid_value, ["value"; value])) ;
+  D.debug "%s: iqn=%S" __FUNCTION__ value ;
   (* Note, the following sequence is carefully written - see the
      other-config watcher thread in xapi_host_helpers.ml *)
   Db.Host.remove_from_other_config ~__context ~self:host ~key:"iscsi_iqn" ;
@@ -2804,7 +2852,7 @@ let set_iscsi_iqn ~__context ~host ~value =
    * when you update the `iscsi_iqn` field we want to update `other_config`,
    * but when updating `other_config` we want to update `iscsi_iqn` too.
    * we have to be careful not to introduce an infinite loop of updates.
-   * *)
+   *)
   Db.Host.set_iscsi_iqn ~__context ~self:host ~value ;
   Db.Host.add_to_other_config ~__context ~self:host ~key:"iscsi_iqn" ~value ;
   Xapi_host_helpers.Configuration.set_initiator_name value
@@ -3057,7 +3105,7 @@ let apply_updates ~__context ~self ~hash =
     if Db.Pool.get_ha_enabled ~__context ~self:pool then
       raise Api_errors.(Server_error (ha_is_enabled, [])) ;
     if Db.Host.get_enabled ~__context ~self then (
-      disable ~__context ~host:self ;
+      disable ~__context ~host:self ~auto_enable:true ;
       Xapi_host_helpers.update_allowed_operations ~__context ~self
     ) ;
     Xapi_host_helpers.with_host_operation ~__context ~self
@@ -3111,3 +3159,181 @@ let emergency_clear_mandatory_guidance ~__context =
          info "%s: %s is cleared" __FUNCTION__ s
      ) ;
   Db.Host.set_pending_guidances ~__context ~self ~value:[]
+
+let set_ssh_auto_mode ~__context ~self ~value =
+  debug "Setting SSH auto mode for host %s to %B"
+    (Helpers.get_localhost_uuid ())
+    value ;
+
+  Db.Host.set_ssh_auto_mode ~__context ~self ~value ;
+
+  try
+    (* When enabled, the ssh_monitor_service regularly checks XAPI status to manage SSH availability.
+       During normal operation when XAPI is running properly, SSH is automatically disabled.
+       SSH is only enabled during emergency scenarios
+       (e.g., when XAPI is down) to allow administrative access for troubleshooting. *)
+    if value then (
+      (* Ensure SSH is always enabled when SSH auto mode is on*)
+      Xapi_systemctl.enable ~wait_until_success:false !Xapi_globs.ssh_service ;
+      Xapi_systemctl.enable ~wait_until_success:false
+        !Xapi_globs.ssh_monitor_service ;
+      Xapi_systemctl.start ~wait_until_success:false
+        !Xapi_globs.ssh_monitor_service
+    ) else (
+      Xapi_systemctl.stop ~wait_until_success:false
+        !Xapi_globs.ssh_monitor_service ;
+      Xapi_systemctl.disable ~wait_until_success:false
+        !Xapi_globs.ssh_monitor_service
+    )
+  with e ->
+    error "Failed to configure SSH auto mode: %s" (Printexc.to_string e) ;
+    Helpers.internal_error "Failed to configure SSH auto mode: %s"
+      (Printexc.to_string e)
+
+let disable_ssh_internal ~__context ~self =
+  try
+    debug "Disabling SSH for host %s" (Helpers.get_localhost_uuid ()) ;
+    if not (Db.Host.get_ssh_auto_mode ~__context ~self) then
+      Xapi_systemctl.disable ~wait_until_success:false !Xapi_globs.ssh_service ;
+    Xapi_systemctl.stop ~wait_until_success:false !Xapi_globs.ssh_service ;
+    Db.Host.set_ssh_enabled ~__context ~self ~value:false
+  with e ->
+    error "Failed to disable SSH for host %s: %s" (Ref.string_of self)
+      (Printexc.to_string e) ;
+    Helpers.internal_error "Failed to disable SSH access, host: %s"
+      (Ref.string_of self)
+
+let set_expiry ~__context ~self ~timeout =
+  let expiry_time =
+    match
+      Ptime.add_span (Ptime_clock.now ())
+        (Ptime.Span.of_int_s (Int64.to_int timeout))
+    with
+    | None ->
+        error "Invalid SSH timeout: %Ld" timeout ;
+        raise
+          (Api_errors.Server_error
+             ( Api_errors.invalid_value
+             , ["ssh_enabled_timeout"; Int64.to_string timeout]
+             )
+          )
+    | Some t ->
+        Ptime.to_float_s t |> Date.of_unix_time
+  in
+  Db.Host.set_ssh_expiry ~__context ~self ~value:expiry_time
+
+let schedule_disable_ssh_job ~__context ~self ~timeout ~auto_mode =
+  let host_uuid = Helpers.get_localhost_uuid () in
+
+  debug "Scheduling SSH disable job for host %s with timeout %Ld seconds"
+    host_uuid timeout ;
+
+  (* Remove any existing job first *)
+  Xapi_stdext_threads_scheduler.Scheduler.remove_from_queue
+    !Xapi_globs.job_for_disable_ssh ;
+
+  Xapi_stdext_threads_scheduler.Scheduler.add_to_queue
+    !Xapi_globs.job_for_disable_ssh
+    Xapi_stdext_threads_scheduler.Scheduler.OneShot (Int64.to_float timeout)
+    (fun () ->
+      disable_ssh_internal ~__context ~self ;
+      (* re-enable SSH auto mode if it was enabled before calling host.enable_ssh *)
+      if auto_mode then
+        set_ssh_auto_mode ~__context ~self ~value:true
+  )
+
+let enable_ssh ~__context ~self =
+  try
+    debug "Enabling SSH for host %s" (Helpers.get_localhost_uuid ()) ;
+
+    let cached_ssh_auto_mode = Db.Host.get_ssh_auto_mode ~__context ~self in
+    (* Disable SSH auto mode when SSH is enabled manually *)
+    set_ssh_auto_mode ~__context ~self ~value:false ;
+
+    Xapi_systemctl.enable ~wait_until_success:false !Xapi_globs.ssh_service ;
+    Xapi_systemctl.start ~wait_until_success:false !Xapi_globs.ssh_service ;
+
+    let timeout = Db.Host.get_ssh_enabled_timeout ~__context ~self in
+    ( match timeout with
+    | 0L ->
+        Xapi_stdext_threads_scheduler.Scheduler.remove_from_queue
+          !Xapi_globs.job_for_disable_ssh ;
+        Db.Host.set_ssh_expiry ~__context ~self ~value:Date.epoch
+    | t ->
+        set_expiry ~__context ~self ~timeout:t ;
+        schedule_disable_ssh_job ~__context ~self ~timeout:t
+          ~auto_mode:cached_ssh_auto_mode
+    ) ;
+
+    Db.Host.set_ssh_enabled ~__context ~self ~value:true
+  with e ->
+    error "Failed to enable SSH on host %s: %s" (Ref.string_of self)
+      (Printexc.to_string e) ;
+    Helpers.internal_error "Failed to enable SSH access, host: %s"
+      (Ref.string_of self)
+
+let disable_ssh ~__context ~self =
+  Xapi_stdext_threads_scheduler.Scheduler.remove_from_queue
+    !Xapi_globs.job_for_disable_ssh ;
+  disable_ssh_internal ~__context ~self ;
+  Db.Host.set_ssh_expiry ~__context ~self ~value:(Date.now ())
+
+let set_ssh_enabled_timeout ~__context ~self ~value =
+  let validate_timeout value =
+    (* the max timeout is two days: 172800L = 2*24*60*60 *)
+    if value < 0L || value > 172800L then
+      raise
+        (Api_errors.Server_error
+           ( Api_errors.invalid_value
+           , ["ssh_enabled_timeout"; Int64.to_string value]
+           )
+        )
+  in
+  validate_timeout value ;
+  debug "Setting SSH timeout for host %s to %Ld seconds"
+    (Db.Host.get_uuid ~__context ~self)
+    value ;
+  Db.Host.set_ssh_enabled_timeout ~__context ~self ~value ;
+  if Db.Host.get_ssh_enabled ~__context ~self then
+    match value with
+    | 0L ->
+        Xapi_stdext_threads_scheduler.Scheduler.remove_from_queue
+          !Xapi_globs.job_for_disable_ssh ;
+        Db.Host.set_ssh_expiry ~__context ~self ~value:Date.epoch
+    | t ->
+        set_expiry ~__context ~self ~timeout:t ;
+        schedule_disable_ssh_job ~__context ~self ~timeout:t ~auto_mode:false
+
+let set_console_idle_timeout ~__context ~self ~value =
+  let assert_timeout_valid timeout =
+    if timeout < 0L then
+      raise
+        (Api_errors.Server_error
+           ( Api_errors.invalid_value
+           , ["console_timeout"; Int64.to_string timeout]
+           )
+        )
+  in
+
+  assert_timeout_valid value ;
+  try
+    let content =
+      match value with
+      | 0L ->
+          "# Console timeout is disabled\n"
+      | timeout ->
+          Printf.sprintf "# Console timeout configuration\nexport TMOUT=%Ld\n"
+            timeout
+    in
+
+    Unixext.atomic_write_to_file !Xapi_globs.console_timeout_profile_path 0o0644
+      (fun fd ->
+        Unix.write fd (Bytes.of_string content) 0 (String.length content)
+        |> ignore
+    ) ;
+
+    Db.Host.set_console_idle_timeout ~__context ~self ~value
+  with e ->
+    error "Failed to configure console timeout: %s" (Printexc.to_string e) ;
+    Helpers.internal_error "Failed to set console timeout: %Ld: %s" value
+      (Printexc.to_string e)

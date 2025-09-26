@@ -285,6 +285,7 @@ module Initial_guest_metrics = Generic.MakeStateless (struct
       Xapi_guest_agent.get_initial_guest_metrics (lookup tree) (list tree)
     in
     guest_metrics.Xapi_guest_agent.networks
+    @ guest_metrics.Xapi_guest_agent.pv_drivers_version
 
   let tests =
     `QuickAndAutoDocumented
@@ -465,6 +466,116 @@ module Initial_guest_metrics = Generic.MakeStateless (struct
           ]
         , []
         )
+      ; (* windows pv driver versions parsing *)
+        ( [
+            ("drivers/0", "XenServer XENBUS 9.1.9.105 ")
+          ; ("drivers/1", "XenServer XENVBD 9.1.8.79 ")
+          ; ("drivers/2", "XenServer XENVIF 9.1.12.101 ")
+          ; ("drivers/3", "XenServer XENIFACE 9.1.10.87 ")
+          ; ("drivers/4", "XenServer XENNET 9.1.7.65 ")
+          ]
+        , [
+            ("micro", "-1")
+          ; ("xennet", "XenServer 9.1.7.65 ")
+          ; ("xeniface", "XenServer 9.1.10.87 ")
+          ; ("xenvif", "XenServer 9.1.12.101 ")
+          ; ("xenvbd", "XenServer 9.1.8.79 ")
+          ; ("xenbus", "XenServer 9.1.9.105 ")
+          ]
+        )
+      ; ( [
+            ("drivers/0", "XenServer XENBUS 9.1.9.105 (DEBUG) (MOREDEBUG)")
+          ; ("drivers/2", "XCP_ng XENVIF 9.1.12.101 ")
+          ]
+        , [
+            ("micro", "-1")
+          ; ("xenvif", "XCP_ng 9.1.12.101 ")
+          ; ("xenbus", "XenServer 9.1.9.105 (DEBUG) (MOREDEBUG)")
+          ]
+        )
+      ]
+end)
+
+module Services = Generic.MakeStateless (struct
+  module Io = struct
+    type input_t = (string * string) list
+
+    type output_t = (string * string) list
+
+    let string_of_input_t = Test_printers.(assoc_list string string)
+
+    let string_of_output_t = Test_printers.(assoc_list string string)
+  end
+
+  (* prototype funtions lookup and list are in Xapi_xenops.ml::update_vm *)
+  let lookup state key = List.assoc_opt key state
+
+  let list_subkeys state dir =
+    if dir = "" then
+      []
+    else
+      let dir =
+        if dir.[0] = '/' then
+          String.sub dir 1 (String.length dir - 1)
+        else
+          dir
+      in
+      let results =
+        List.filter_map
+          (fun (path, _) ->
+            if String.starts_with ~prefix:dir path then
+              let rest =
+                String.sub path (String.length dir)
+                  (String.length path - String.length dir)
+              in
+              let is_sep = function '/' -> true | _ -> false in
+              match Astring.String.fields ~empty:false ~is_sep rest with
+              | x :: _ ->
+                  Some x
+              | _ ->
+                  None
+            else
+              None
+          )
+          state
+        |> Xapi_stdext_std.Listext.List.setify
+      in
+      results
+
+  let transform input =
+    Xapi_guest_agent.get_guest_services (lookup input) (list_subkeys input)
+
+  let tests =
+    `QuickAndAutoDocumented
+      [
+        (* no data/service *)
+        ([("data/key1", "v1"); ("data/key2", "v2")], [])
+      ; (* less than two depth in data/service *)
+        ([("data/service/key1", "v1"); ("data/service/key2", "v2")], [])
+      ; (* beyond two depth in data/service *)
+        ( [
+            ("data/service/service-a/sub/key1", "sab-v1")
+          ; ("data/service/service-a/sub/key2", "sab-v2")
+          ]
+        , [("service-a/sub", "")]
+        )
+      ; (* normal case *)
+        ( [
+            ("data/service", "")
+          ; ("data/service/service-a", "")
+          ; ("data/service/service-b", "")
+          ; ("data/service/service-a/key1", "sa-v1")
+          ; ("data/service/service-a/key2", "sa-v2")
+          ; ("data/service/service-b/key1", "sb-v1")
+          ; ("data/service/service-b/key2", "sb-v2")
+          ]
+        , [
+            ("service-a/key1", "sa-v1")
+          ; ("service-a/key2", "sa-v2")
+          ; ("service-b/key1", "sb-v1")
+          ; ("service-b/key2", "sb-v2")
+          ]
+        )
       ]
 end)
 
@@ -473,4 +584,5 @@ let tests =
     [
       ("networks", Networks.tests)
     ; ("get_initial_guest_metrics", Initial_guest_metrics.tests)
+    ; ("get_guest_services", Services.tests)
     ]

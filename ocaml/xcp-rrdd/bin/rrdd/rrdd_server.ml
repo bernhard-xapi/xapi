@@ -300,7 +300,6 @@ let migrate_rrd (session_id : string option) (remote_address : string)
           Some x
       | None ->
           debug "VM %s RRDs not found on migrate! Continuing anyway..." vm_uuid ;
-          log_backtrace () ;
           None
   )
   |> Option.iter (fun rrdi ->
@@ -572,11 +571,6 @@ let update_use_min_max (value : bool) : unit =
   debug "Updating use_min_max: New value=%b" value ;
   use_min_max := value
 
-let update_vm_memory_target (domid : int) (target : int64) : unit =
-  with_lock memory_targets_m (fun _ ->
-      Hashtbl.replace memory_targets domid target
-  )
-
 let set_cache_sr (sr_uuid : string) : unit =
   with_lock cache_sr_lock (fun () -> cache_sr_uuid := Some sr_uuid)
 
@@ -693,12 +687,13 @@ module Plugin = struct
           (* reset skip counts *)
           payload
         with e -> (
+          Backtrace.is_important e ;
           incr_skip_count uid plugin ;
           (* increase skip count *)
           let log e =
             info "Failed to process plugin metrics file: %s (%s)"
               (P.string_of_uid ~uid) (Printexc.to_string e) ;
-            log_backtrace ()
+            log_backtrace e
           in
           let open Rrd_protocol in
           match e with
@@ -716,8 +711,12 @@ module Plugin = struct
       let next_reading (uid : P.uid) : float =
         let open Rrdd_shared in
         if with_lock registered_m (fun _ -> Hashtbl.mem registered uid) then
-          with_lock last_loop_end_time_m (fun _ ->
-              !last_loop_end_time +. !timeslice -. Unix.gettimeofday ()
+          with_lock next_iteration_start_m (fun _ ->
+              match Clock.Timer.remaining !next_iteration_start with
+              | Remaining diff ->
+                  Clock.Timer.span_to_s diff
+              | Expired diff ->
+                  Clock.Timer.span_to_s diff *. -1.
           )
         else
           -1.

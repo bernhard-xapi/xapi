@@ -78,6 +78,9 @@ type numainfo = {memory: meminfo array; distances: int array array}
 
 type cputopo = {core: int; socket: int; node: int}
 
+external vcpu_setaffinity_hard : handle -> domid -> int -> bool array -> unit
+  = "stub_xenctrlext_vcpu_setaffinity_hard"
+
 external vcpu_setaffinity_soft : handle -> domid -> int -> bool array -> unit
   = "stub_xenctrlext_vcpu_setaffinity_soft"
 
@@ -91,5 +94,17 @@ external combine_cpu_policies : int64 array -> int64 array -> int64 array
 external policy_is_compatible : int64 array -> int64 array -> string option
   = "stub_xenctrlext_featuresets_are_compatible"
 
-external domain_claim_pages : handle -> domid -> int -> unit
-  = "stub_xenctrlext_domain_claim_pages"
+module NumaNode : sig
+  type t
+
+  val none : t
+
+  val from : int -> t
+end
+
+exception Not_available
+
+val domain_claim_pages : handle -> domid -> ?numa_node:NumaNode.t -> int -> unit
+(** Raises {Unix_error} if there's not enough memory to claim in the system.
+    Raises {Not_available} if a single numa node is requested and xen does not
+    provide page claiming for single numa nodes. *)

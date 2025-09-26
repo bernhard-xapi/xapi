@@ -153,7 +153,7 @@ type build_info = {
   ; kernel: string  (** in hvm case, point to hvmloader *)
   ; vcpus: int  (** vcpus max *)
   ; priv: builder_spec_info
-  ; has_hard_affinity: bool [@default false]
+  ; hard_affinity: int list list [@default []]
 }
 [@@deriving rpcty]
 
@@ -203,8 +203,6 @@ let assert_file_is_readable filename =
   with _ ->
     error "Cannot read file %s" filename ;
     raise (Could_not_read_file filename)
-
-let maybe f = function None -> () | Some x -> f x
 
 (* Recursively iterate over a directory and all its children, calling fn for
    each *)
@@ -271,7 +269,8 @@ let wait_xen_free_mem ~xc ?(maximum_wait_time_seconds = 64) required_memory_kib
   in
   wait 0
 
-let make ~xc ~xs vm_info vcpus domain_config uuid final_uuid no_sharept =
+let make ~xc ~xs vm_info vcpus domain_config uuid final_uuid no_sharept
+    num_of_vbds num_of_vifs =
   let open Xenctrl in
   let host_info = Xenctrl.physinfo xc in
 
@@ -387,12 +386,80 @@ let make ~xc ~xs vm_info vcpus domain_config uuid final_uuid no_sharept =
     ; max_evtchn_port= -1
     ; max_grant_frames=
         ( try int_of_string (List.assoc "max_grant_frames" vm_info.platformdata)
-          with _ -> 64
+          with _ ->
+            let max_per_vif = 8 in
+            (* 1 VIF takes up (256 rx entries + 256 tx entries) * 8 queues max
+             * 8 bytes per grant table entry / 4096 bytes size of frame *)
+            let reasonable_per_vbd = 1 in
+            (* (1 ring (itself taking up one granted page) + 1 ring *
+               32 requests * 11 grant refs contained in each * 8 bytes ) /
+               4096 bytes size of frame = 0.6875, rounded up *)
+            let frames_number =
+              max 64
+                ((max_per_vif * (num_of_vifs + 1))
+                + (reasonable_per_vbd * (num_of_vbds + 1))
+                )
+            in
+            debug "estimated max_grant_frames = %d" frames_number ;
+            frames_number
+            (* max_per_vif * (num_of_vifs + 1 hotplugged future one) +
+               max_per_vbd * (num_of_vbds + 1 hotplugged future one) *)
+
+            (* NOTE: While the VIF calculation is precise, the VBD one is a
+               very rough approximation of a reasonable value of
+               RING_SIZE * MAX_SEGMENTS_PER_REQUEST + PAGES_FOR_RING_ITSELF
+               The following points should allow for a rough understanding
+               of the scale of the problem of better estimation:
+
+               1) The blkfront driver can consume different numbers of grant
+               pages depending on the features advertised by the back driver
+               (and negotiated with it). These features can differ per VBD, and
+               right now aren't even known at the time of domain creation.
+               These include:
+                 1.1) indirect segments - these contain
+                 BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST grants at most, and each
+                 of these frames contains GRANTS_PER_INDIRECT_FRAME grants in
+                 turn (stored in blkif_request_segment).
+                 In practice, this means a catastrophic explosion - we should
+                 not really aim to detect if indirect requests feature is on,
+                 but turn it off to get reasonable estimates.
+                 1.2) persistent grants - these are an optimization, so
+                 shouldn't really change the calculations, worst case is none
+                 of the grants are persistent.
+                 1.3) multi-page rings - these change the RING_SIZE, but not in
+                 a trivial manner (see ring-page-order)
+                 1.4) multi-queue - these change the number of rings, adding
+                 another multiplier.
+               2) The "8 bytes" multiplier for a grant table entry only applies
+               to grants_v1. v2 grants take up 16 bytes per entry. And it's
+               impossible to detect this feature at the moment.
+               3) A dynamically-sized grant table itself could be a solution?
+               Used to exist before, caused a lot of XSAs, hard to get right.
+               4) Drivers might need to be more explicitly limited in how many
+               pages they can consume
+               5) VBD backdriver's features should be managed by XAPI on the
+               object itself and (their max bound) known at the time of domain
+               creation.
+
+               So for this estimate, there is only 1 ring which is 1 page, with
+               32 entries, each entry (request) can have up to 11 pages
+               (excluding indirect pages and other complications).
+
+               SEE: xen-blkfront.c, blkif.h, and the backdriver to understand
+               the process of negotiation (visible in xenstore, in kernel
+               module parameters in the sys filesystem afterwards)
+            *)
         )
     ; max_maptrack_frames=
         ( try
             int_of_string (List.assoc "max_maptrack_frames" vm_info.platformdata)
-          with _ -> 1024
+          with _ ->
+            0
+            (* This should be >0 only for driver domains (Dom0 startup is not
+               handled by the toolstack), which currently do not exist.
+               To support these in the future, xenopsd would need to check what
+               type of domain is being started.
+            *)
         )
     ; max_grant_version=
         (if List.mem CAP_Gnttab_v2 host_info.capabilities then 2 else 1)
@@ -503,6 +570,9 @@ let make ~xc ~xs vm_info vcpus domain_config uuid final_uuid no_sharept =
     xs.Xs.writev (dom_path ^ "/bios-strings") vm_info.bios_strings ;
     if vm_info.is_uefi then
       xs.Xs.write (dom_path ^ "/hvmloader/bios") "ovmf" ;
+    xs.Xs.write
+      (dom_path ^ "/hvmloader/pci/xen-platform-pci-bar-uc")
+      (if !Xenopsd.xen_platform_pci_bar_uc then "1" else "0") ;
     (* If a toolstack sees a domain which it should own in this state then the
        domain is not completely setup and should be shutdown. *)
     xs.Xs.write (dom_path ^ "/action-request") "poweroff" ;
@@ -859,47 +929,78 @@ let numa_init () =
     )
     mem
 
-let numa_placement domid ~vcpus ~memory =
+let set_affinity = function
+  | Xenops_server.Hard ->
+      Xenctrlext.vcpu_setaffinity_hard
+  | Xenops_server.Soft ->
+      Xenctrlext.vcpu_setaffinity_soft
+
+let numa_placement domid ~vcpus ~memory affinity =
   let open Xenctrlext in
   let open Topology in
-  let hint =
-    with_lock numa_mutex (fun () ->
-        let ( let* ) = Option.bind in
-        let xcext = get_handle () in
-        let* host = Lazy.force numa_hierarchy in
-        let numa_meminfo = (numainfo xcext).memory |> Array.to_list in
-        let nodes =
-          ListLabels.map2
-            (NUMA.nodes host |> List.of_seq)
-            numa_meminfo
-            ~f:(fun node m -> NUMA.resource host node ~memory:m.memfree)
-        in
-        let vm = NUMARequest.make ~memory ~vcpus in
-        let nodea =
-          match !numa_resources with
-          | None ->
-              Array.of_list nodes
-          | Some a ->
-              Array.map2 NUMAResource.min_memory (Array.of_list nodes) a
-        in
-        numa_resources := Some nodea ;
-        Softaffinity.plan ~vm host nodea
-    )
-  in
-  let xcext = get_handle () in
-  ( match hint with
-  | None ->
-      D.debug "NUMA-aware placement failed for domid %d" domid
-  | Some soft_affinity ->
-      let cpua = CPUSet.to_mask soft_affinity in
-      for i = 0 to vcpus - 1 do
-        Xenctrlext.vcpu_setaffinity_soft xcext domid i cpua
-      done
-  ) ;
-  let nr_pages = Int64.div memory 4096L |> Int64.to_int in
-  Xenctrlext.domain_claim_pages xcext domid nr_pages
+  with_lock numa_mutex (fun () ->
+      let ( let* ) = Option.bind in
+      let xcext = get_handle () in
+      let* host = Lazy.force numa_hierarchy in
+      let numa_meminfo = (numainfo xcext).memory |> Array.to_list in
+      let nodes =
+        ListLabels.map2
+          (NUMA.nodes host |> List.of_seq)
+          numa_meminfo
+          ~f:(fun node m -> NUMA.resource host node ~memory:m.memfree)
+      in
+      let vm = NUMARequest.make ~memory ~vcpus in
+      let nodea =
+        match !numa_resources with
+        | None ->
+            Array.of_list nodes
+        | Some a ->
+            Array.map2 NUMAResource.min_memory (Array.of_list nodes) a
+      in
+      numa_resources := Some nodea ;
+      let memory_plan =
+        match Softaffinity.plan ~vm host nodea with
+        | None ->
+            D.debug "NUMA-aware placement failed for domid %d" domid ;
+            []
+        | Some (cpu_affinity, mem_plan) ->
+            let cpus = CPUSet.to_mask cpu_affinity in
+            for i = 0 to vcpus - 1 do
+              set_affinity affinity xcext domid i cpus
+            done ;
+            mem_plan
+      in
+      (* Xen only allows a single node when using memory claims, or none at all. *)
+      let* numa_node, node =
+        match memory_plan with
+        | [Node node] ->
+            Some (Xenctrlext.NumaNode.from node, node)
+        | [] | _ :: _ :: _ ->
+            D.debug
+              "%s: domain %d can't fit a single NUMA node, falling back to \
+               default behaviour"
+              __FUNCTION__ domid ;
+            None
+      in
+      let nr_pages = Int64.div memory 4096L |> Int64.to_int in
+      try
+        Xenctrlext.domain_claim_pages xcext domid ~numa_node nr_pages ;
+        Some (node, memory)
+      with
+      | Xenctrlext.Not_available ->
+          (* Xen does not provide the interface to claim pages from a single NUMA
+             node, ignore the error and continue. *)
+          None
+      | Xenctrlext.Unix_error (errno, _) ->
+          D.info
+            "%s: unable to claim enough memory, domain %d won't be hosted in a \
+             single NUMA node. (error %s)"
+            __FUNCTION__ domid
+            Unix.(error_message errno) ;
+          None
+  )
 
-let build_pre ~xc ~xs ~vcpus ~memory ~has_hard_affinity domid =
+let build_pre ~xc ~xs ~vcpus ~memory ~hard_affinity domid =
   let open Memory in
   let uuid = get_uuid ~xc domid in
   debug "VM = %s; domid = %d; waiting for %Ld MiB of free host memory"
@@ -921,7 +1022,7 @@ let build_pre ~xc ~xs ~vcpus ~memory ~has_hard_affinity domid =
   let timer_mode = int_platform_flag "timer_mode" in
   let log_reraise call_str f =
     debug "VM = %s; domid = %d; %s" (Uuidx.to_string uuid) domid call_str ;
-    try ignore (f ())
+    try f ()
     with e ->
       let bt = Printexc.get_backtrace () in
       debug "Backtrace: %s" bt ;
@@ -931,7 +1032,7 @@ let build_pre ~xc ~xs ~vcpus ~memory ~has_hard_affinity domid =
       error "VM = %s; domid = %d; %s" (Uuidx.to_string uuid) domid err_msg ;
       raise (Domain_build_pre_failed err_msg)
   in
-  maybe
+  Option.iter
     (fun mode ->
       log_reraise (Printf.sprintf "domain_set_timer_mode %d" mode) (fun () ->
           let xcext = Xenctrlext.get_handle () in
@@ -951,42 +1052,82 @@ let build_pre ~xc ~xs ~vcpus ~memory ~has_hard_affinity domid =
   log_reraise (Printf.sprintf "shadow_allocation_set %d MiB" shadow_mib)
     (fun () -> Xenctrl.shadow_allocation_set xc domid shadow_mib
   ) ;
-  let () =
+  let apply_hard_vcpu_map () =
+    let xcext = Xenctrlext.get_handle () in
+    let pcpus = Xenctrlext.get_max_nr_cpus xcext in
+    let bitmap cpus : bool array =
+      (* convert a mask into a boolean array, one element per pCPU *)
+      let cpus = List.filter (fun x -> x >= 0 && x < pcpus) cpus in
+      let result = Array.init pcpus (fun _ -> false) in
+      List.iter (fun cpu -> result.(cpu) <- true) cpus ;
+      result
+    in
+    ( match hard_affinity with
+    | [] ->
+        []
+    | m :: ms ->
+        (* Treat the first as the template for the rest *)
+        let all_vcpus = List.init vcpus Fun.id in
+        let defaults = List.map (fun _ -> m) all_vcpus in
+        Xapi_stdext_std.Listext.List.take vcpus ((m :: ms) @ defaults)
+    )
+    |> List.iteri (fun vcpu mask ->
+           Xenctrlext.vcpu_setaffinity_hard xcext domid vcpu (bitmap mask)
+       )
+  in
+  apply_hard_vcpu_map () ;
+  let node_placement =
     match !Xenops_server.numa_placement with
     | Any ->
-        ()
-    | Best_effort ->
+        None
+    | (Best_effort | Best_effort_hard) as pin ->
         log_reraise (Printf.sprintf "NUMA placement") (fun () ->
-            if has_hard_affinity then
-              D.debug "VM has hard affinity set, skipping NUMA optimization"
-            else
+            if hard_affinity <> [] then (
+              D.debug "VM has hard affinity set, skipping NUMA optimization" ;
+              None
+            ) else
+              let affinity =
+                Xenops_server.affinity_of_numa_affinity_policy pin
+              in
               numa_placement domid ~vcpus
                 ~memory:(Int64.mul memory.xen_max_mib 1048576L)
+                affinity
+              |> Option.map fst
         )
   in
-  create_channels ~xc uuid domid
+  let store_chan, console_chan = create_channels ~xc uuid domid in
+  (store_chan, console_chan, node_placement)
+
+let args_numa_placements numa_placement =
+  Option.fold ~none:[]
+    ~some:(fun node -> ["-mem_pnode"; Printf.sprintf "%d" node])
+    numa_placement
 
 let xenguest_args_base ~domid ~store_port ~store_domid ~console_port
-    ~console_domid ~memory =
+    ~console_domid ~memory ~numa_placement =
   [
-    "-domid"
-  ; string_of_int domid
-  ; "-store_port"
-  ; string_of_int store_port
-  ; "-store_domid"
-  ; string_of_int store_domid
-  ; "-console_port"
-  ; string_of_int console_port
-  ; "-console_domid"
-  ; string_of_int console_domid
-  ; "-mem_max_mib"
-  ; Int64.to_string memory.Memory.build_max_mib
-  ; "-mem_start_mib"
-  ; Int64.to_string memory.Memory.build_start_mib
+    [
+      "-domid"
+    ; string_of_int domid
+    ; "-store_port"
+    ; string_of_int store_port
+    ; "-store_domid"
+    ; string_of_int store_domid
+    ; "-console_port"
+    ; string_of_int console_port
+    ; "-console_domid"
+    ; string_of_int console_domid
+    ; "-mem_max_mib"
+    ; Int64.to_string memory.Memory.build_max_mib
+    ; "-mem_start_mib"
+    ; Int64.to_string memory.Memory.build_start_mib
+    ]
+  ; args_numa_placements numa_placement
   ]
+  |> List.concat
 
 let xenguest_args_hvm ~domid ~store_port ~store_domid ~console_port
-    ~console_domid ~memory ~kernel ~vgpus =
+    ~console_domid ~memory ~kernel ~vgpus ~numa_placement =
   ["-mode"; "hvm_build"; "-image"; kernel]
   @ (vgpus |> function
      | Xenops_interface.Vgpu.{implementation= Nvidia _; _} :: _ ->
@@ -995,10 +1136,10 @@ let xenguest_args_hvm ~domid ~store_port ~store_domid ~console_port
          []
     )
   @ xenguest_args_base ~domid ~store_port ~store_domid ~console_port
-      ~console_domid ~memory
+      ~console_domid ~memory ~numa_placement
 
 let xenguest_args_pv ~domid ~store_port ~store_domid ~console_port
-    ~console_domid ~memory ~kernel ~cmdline ~ramdisk =
+    ~console_domid ~memory ~kernel ~cmdline ~ramdisk ~numa_placement =
   [
     "-mode"
   ; "linux_build"
@@ -1014,10 +1155,10 @@ let xenguest_args_pv ~domid ~store_port ~store_domid ~console_port
   ; "0"
   ]
   @ xenguest_args_base ~domid ~store_port ~store_domid ~console_port
-      ~console_domid ~memory
+      ~console_domid ~memory ~numa_placement
 
 let xenguest_args_pvh ~domid ~store_port ~store_domid ~console_port
-    ~console_domid ~memory ~kernel ~cmdline ~modules =
+    ~console_domid ~memory ~kernel ~cmdline ~modules ~numa_placement =
   let module_args =
     List.concat_map
       (fun (m, c) ->
@@ -1039,7 +1180,7 @@ let xenguest_args_pvh ~domid ~store_port ~store_domid ~console_port
   ]
   @ module_args
   @ xenguest_args_base ~domid ~store_port ~store_domid ~console_port
-      ~console_domid ~memory
+      ~console_domid ~memory ~numa_placement
 
 let xenguest task xenguest_path domid uuid args =
   let line =
@@ -1073,8 +1214,8 @@ let correct_shadow_allocation xc domid uuid shadow_mib =
   )
 
 (* puts value in store after the domain build succeed *)
-let build_post ~xc ~xs ~vcpus:_ ~static_max_mib ~target_mib domid domain_type
-    store_mfn store_port ents vments =
+let build_post ~xc ~xs ~static_max_mib ~target_mib domid domain_type store_mfn
+    store_port ents vments =
   let uuid = get_uuid ~xc domid in
   let dom_path = xs.Xs.getdomainpath domid in
   (* Unit conversion. *)
@@ -1118,7 +1259,7 @@ let build (task : Xenops_task.task_handle) ~xc ~xs ~store_domid ~console_domid
   let target_kib = info.memory_target in
   let vcpus = info.vcpus in
   let kernel = info.kernel in
-  let has_hard_affinity = info.has_hard_affinity in
+  let hard_affinity = info.hard_affinity in
   let force_arg = if force then ["--force"] else [] in
   assert_file_is_readable kernel ;
   (* Convert memory configuration values into the correct units. *)
@@ -1136,13 +1277,13 @@ let build (task : Xenops_task.task_handle) ~xc ~xs ~store_domid ~console_domid
             shadow_multiplier
         in
         maybe_ca_140252_workaround ~xc ~vcpus domid ;
-        let store_port, console_port =
-          build_pre ~xc ~xs ~memory ~vcpus ~has_hard_affinity domid
+        let store_port, console_port, numa_placement =
+          build_pre ~xc ~xs ~memory ~vcpus ~hard_affinity domid
         in
         let store_mfn, console_mfn =
           let args =
             xenguest_args_hvm ~domid ~store_port ~store_domid ~console_port
-              ~console_domid ~memory ~kernel ~vgpus
+              ~console_domid ~memory ~kernel ~vgpus ~numa_placement
             @ force_arg
             @ extras
           in
@@ -1163,15 +1304,15 @@ let build (task : Xenops_task.task_handle) ~xc ~xs ~store_domid ~console_domid
           Memory.Linux.full_config static_max_mib video_mib target_mib vcpus
             shadow_multiplier
         in
-        maybe assert_file_is_readable pvinfo.ramdisk ;
-        let store_port, console_port =
-          build_pre ~xc ~xs ~memory ~vcpus ~has_hard_affinity domid
+        Option.iter assert_file_is_readable pvinfo.ramdisk ;
+        let store_port, console_port, numa_placement =
+          build_pre ~xc ~xs ~memory ~vcpus ~hard_affinity domid
         in
         let store_mfn, console_mfn =
           let args =
             xenguest_args_pv ~domid ~store_port ~store_domid ~console_port
               ~console_domid ~memory ~kernel ~cmdline:pvinfo.cmdline
-              ~ramdisk:pvinfo.ramdisk
+              ~ramdisk:pvinfo.ramdisk ~numa_placement
             @ force_arg
             @ extras
           in
@@ -1187,13 +1328,13 @@ let build (task : Xenops_task.task_handle) ~xc ~xs ~store_domid ~console_domid
             shadow_multiplier
         in
         maybe_ca_140252_workaround ~xc ~vcpus domid ;
-        let store_port, console_port =
-          build_pre ~xc ~xs ~memory ~vcpus ~has_hard_affinity domid
+        let store_port, console_port, numa_placement =
+          build_pre ~xc ~xs ~memory ~vcpus ~hard_affinity domid
         in
         let store_mfn, console_mfn =
           let args =
             xenguest_args_pvh ~domid ~store_port ~store_domid ~console_port
-              ~console_domid ~memory ~kernel ~cmdline ~modules
+              ~console_domid ~memory ~kernel ~cmdline ~modules ~numa_placement
             @ force_arg
             @ extras
           in
@@ -1209,8 +1350,8 @@ let build (task : Xenops_task.task_handle) ~xc ~xs ~store_domid ~console_domid
         )
   in
   let local_stuff = console_keys console_port console_mfn in
-  build_post ~xc ~xs ~vcpus ~target_mib ~static_max_mib domid domain_type
-    store_mfn store_port local_stuff vm_stuff
+  build_post ~xc ~xs ~target_mib ~static_max_mib domid domain_type store_mfn
+    store_port local_stuff vm_stuff
 
 type suspend_flag = Live | Debug
 
@@ -1223,8 +1364,8 @@ let dm_flags =
       []
 
 let with_emu_manager_restore (task : Xenops_task.task_handle) ~domain_type
-    ~(dm : Device.Profile.t) ~store_port ~console_port ~extras manager_path
-    domid _uuid main_fd vgpu_fd f =
+    ~(dm : Device.Profile.t) ~store_port ~console_port ~extras ~numa_placements
+    manager_path domid _uuid main_fd vgpu_fd f =
   let mode =
     match domain_type with `hvm | `pvh -> "hvm_restore" | `pv -> "restore"
   in
@@ -1242,20 +1383,24 @@ let with_emu_manager_restore (task : Xenops_task.task_handle) ~domain_type
   let fds = [(fd_uuid, main_fd)] @ vgpu_args in
   let args =
     [
-      "-mode"
-    ; mode
-    ; "-domid"
-    ; string_of_int domid
-    ; "-fd"
-    ; fd_uuid
-    ; "-store_port"
-    ; string_of_int store_port
-    ; "-console_port"
-    ; string_of_int console_port
+      [
+        "-mode"
+      ; mode
+      ; "-domid"
+      ; string_of_int domid
+      ; "-fd"
+      ; fd_uuid
+      ; "-store_port"
+      ; string_of_int store_port
+      ; "-console_port"
+      ; string_of_int console_port
+      ]
+    ; args_numa_placements numa_placements
+    ; dm_flags dm
+    ; extras
+    ; vgpu_cmdline
     ]
-    @ dm_flags dm
-    @ extras
-    @ vgpu_cmdline
+    |> List.concat
   in
   Emu_manager.with_connection task manager_path args fds f
 
@@ -1307,9 +1452,8 @@ let consume_qemu_record fd limit domid uuid =
     (fun () -> Unix.close fd2)
 
 let restore_common (task : Xenops_task.task_handle) ~xc ~xs
-    ~(dm : Device.Profile.t) ~domain_type ~store_port ~store_domid:_
-    ~console_port ~console_domid:_ ~no_incr_generationid:_ ~vcpus:_ ~extras
-    ~vtpm manager_path domid main_fd vgpu_fd =
+    ~(dm : Device.Profile.t) ~domain_type ~store_port ~console_port ~extras
+    ~vtpm ~numa_placements manager_path domid main_fd vgpu_fd =
   let module DD = Debug.Make (struct let name = "mig64" end) in
   let open DD in
   let uuid = get_uuid ~xc domid in
@@ -1322,8 +1466,8 @@ let restore_common (task : Xenops_task.task_handle) ~xc ~xs
         match
           with_conversion_script task "Emu_manager" hvm main_fd (fun pipe_r ->
               with_emu_manager_restore task ~domain_type ~dm ~store_port
-                ~console_port ~extras manager_path domid uuid pipe_r vgpu_fd
-                (fun cnx -> restore_libxc_record cnx domid uuid
+                ~console_port ~extras ~numa_placements manager_path domid uuid
+                pipe_r vgpu_fd (fun cnx -> restore_libxc_record cnx domid uuid
               )
           )
         with
@@ -1362,7 +1506,8 @@ let restore_common (task : Xenops_task.task_handle) ~xc ~xs
             [main_fd]
       in
       with_emu_manager_restore task ~domain_type ~dm ~store_port ~console_port
-        ~extras manager_path domid uuid main_fd vgpu_fd (fun cnx ->
+        ~extras ~numa_placements manager_path domid uuid main_fd vgpu_fd
+        (fun cnx ->
           (* Maintain a list of results returned by emu-manager that are
              expected by the reader threads. Contains the emu for which a result
              is wanted plus an event channel for waking up the reader once the
@@ -1573,9 +1718,8 @@ let restore_common (task : Xenops_task.task_handle) ~xc ~xs
         (Uuidx.to_string uuid) domid e ;
       raise Suspend_image_failure
 
-let restore (task : Xenops_task.task_handle) ~xc ~xs ~dm ~store_domid
-    ~console_domid ~no_incr_generationid ~timeoffset ~extras info ~manager_path
-    ~vtpm domid fd vgpu_fd =
+let restore (task : Xenops_task.task_handle) ~xc ~xs ~dm ~timeoffset ~extras
+    info ~manager_path ~vtpm domid fd vgpu_fd =
   let static_max_kib = info.memory_max in
   let target_kib = info.memory_target in
   let vcpus = info.vcpus in
@@ -1616,21 +1760,19 @@ let restore (task : Xenops_task.task_handle) ~xc ~xs ~dm ~store_domid
         maybe_ca_140252_workaround ~xc ~vcpus domid ;
         (memory, vm_stuff, `pvh)
   in
-  let store_port, console_port =
-    build_pre ~xc ~xs ~memory ~vcpus ~has_hard_affinity:info.has_hard_affinity
-      domid
+  let store_port, console_port, numa_placements =
+    build_pre ~xc ~xs ~memory ~vcpus ~hard_affinity:info.hard_affinity domid
   in
   let store_mfn, console_mfn =
-    restore_common task ~xc ~xs ~dm ~domain_type ~store_port ~store_domid
-      ~console_port ~console_domid ~no_incr_generationid ~vcpus ~extras ~vtpm
-      manager_path domid fd vgpu_fd
+    restore_common task ~xc ~xs ~dm ~domain_type ~store_port ~console_port
+      ~extras ~vtpm ~numa_placements manager_path domid fd vgpu_fd
   in
   let local_stuff = console_keys console_port console_mfn in
   (* And finish domain's building *)
-  build_post ~xc ~xs ~vcpus ~target_mib ~static_max_mib domid domain_type
-    store_mfn store_port local_stuff vm_stuff
+  build_post ~xc ~xs ~target_mib ~static_max_mib domid domain_type store_mfn
+    store_port local_stuff vm_stuff
 
-let suspend_emu_manager ~(task : Xenops_task.task_handle) ~xc:_ ~xs ~domain_type
+let suspend_emu_manager ~(task : Xenops_task.task_handle) ~xs ~domain_type
     ~is_uefi ~vtpm ~dm ~manager_path ~domid ~uuid ~main_fd ~vgpu_fd ~flags
     ~progress_callback ~qemu_domid ~do_suspend_callback =
   let open Suspend_image in
@@ -1842,9 +1984,9 @@ let suspend (task : Xenops_task.task_handle) ~xc ~xs ~domain_type ~is_uefi ~dm
     write_header main_fd (Xenops, Int64.of_int xenops_rec_len) >>= fun () ->
     debug "Writing Xenops record contents" ;
     Io.write main_fd xenops_record ;
-    suspend_emu_manager ~task ~xc ~xs ~domain_type ~is_uefi ~vtpm ~dm
-      ~manager_path ~domid ~uuid ~main_fd ~vgpu_fd ~flags ~progress_callback
-      ~qemu_domid ~do_suspend_callback
+    suspend_emu_manager ~task ~xs ~domain_type ~is_uefi ~vtpm ~dm ~manager_path
+      ~domid ~uuid ~main_fd ~vgpu_fd ~flags ~progress_callback ~qemu_domid
+      ~do_suspend_callback
     >>= fun () ->
     ( if is_uefi then
         write_varstored_record task ~xs domid main_fd >>= fun () ->

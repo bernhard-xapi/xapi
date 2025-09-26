@@ -101,6 +101,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
           ; "sr-uuid"
           ; "network-uuid"
           ; "pool-uuid"
+          ; "public"
           ]
       ; help= "Create a binary blob to be associated with an API object"
       ; implementation= No_fd Cli_operations.blob_create
@@ -127,14 +128,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= []
       }
     )
-  ; (* "host-introduce",
-       {
-       reqd=["name"; "address"; "remote-port"; "remote-username"; "remote-password"];
-       optn=["description"];
-       help="Introduce a remote host";
-       implementation=No_fd Cli_operations.host_introduce
-       };*)
-    ( "pool-enable-binary-storage"
+  ; ( "pool-enable-binary-storage"
     , {
         reqd= []
       ; optn= []
@@ -535,6 +529,18 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= []
       }
     )
+  ; ( "pool-get-cpu-features"
+    , {
+        reqd= []
+      ; optn= []
+      ; help=
+          {|Prints a hexadecimal representation of the pool's physical-CPU
+           features for PV and HVM VMs. These are combinations of all the
+           hosts' policies and are used when starting new VMs in a pool.|}
+      ; implementation= No_fd Cli_operations.pool_get_cpu_features
+      ; flags= []
+      }
+    )
   ; ( "host-is-in-emergency-mode"
     , {
         reqd= []
@@ -573,8 +579,10 @@ let rec cmdtable_data : (string * cmd_spec) list =
   ; ( "host-disable"
     , {
         reqd= []
-      ; optn= []
-      ; help= "Disable the XE host."
+      ; optn= ["auto-enable"]
+      ; help=
+          "Disable the XE host. Setting auto-enable=false will keep the host \
+           persistently disabled until manually re-enabled with Host.enable."
       ; implementation= No_fd Cli_operations.host_disable
       ; flags= [Host_selectors]
       }
@@ -816,7 +824,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
   ; ( "host-emergency-ha-disable"
     , {
         reqd= []
-      ; optn= ["force"]
+      ; optn= ["force"; "soft"]
       ; help=
           "Disable HA on the local host. Only to be used to recover a pool \
            with a broken HA setup."
@@ -958,8 +966,9 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; optn= ["args:"]
       ; help=
           "Calls the function within the plugin on the given host with \
-           optional arguments."
-      ; implementation= No_fd Cli_operations.host_call_plugin
+           optional arguments. The syntax args:key:file=/path/file.ext passes \
+           the content of /path/file.ext under key to the plugin."
+      ; implementation= With_fd Cli_operations.host_call_plugin
       ; flags= []
       }
     )
@@ -1017,8 +1026,10 @@ let rec cmdtable_data : (string * cmd_spec) list =
         reqd= []
       ; optn= ["uuid"]
       ; help=
-          "Prints a hexadecimal representation of the host's physical-CPU \
-           features."
+          {|Prints a hexadecimal representation of the host's physical-CPU
+           features for PV and HVM VMs. features_{hvm,pv} are "maximum"
+           featuresets the host will accept during migrations, and
+           features_{hvm,pv}_host will be used to start new VMs.|}
       ; implementation= No_fd Cli_operations.host_get_cpu_features
       ; flags= []
       }
@@ -1047,6 +1058,32 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; optn= []
       ; help= "Apply updates from enabled repository on specified host."
       ; implementation= No_fd Cli_operations.host_apply_updates
+      ; flags= [Host_selectors]
+      }
+    )
+  ; ( "host-enable-ssh"
+    , {
+        reqd= []
+      ; optn= []
+      ; help=
+          "Enable SSH access on the host. It will start the service sshd only \
+           if it is not running. It will also enable the service sshd only if \
+           it is not enabled. A newly joined host in the pool or an ejected \
+           host from the pool would keep the original status."
+      ; implementation= No_fd Cli_operations.host_enable_ssh
+      ; flags= [Host_selectors]
+      }
+    )
+  ; ( "host-disable-ssh"
+    , {
+        reqd= []
+      ; optn= []
+      ; help=
+          "Disable SSH access on the host. It will stop the service sshd only \
+           if it is running. It will also disable the service sshd only if it \
+           is enabled. A newly joined host in the pool or an ejected host from \
+           the pool would keep the original status."
+      ; implementation= No_fd Cli_operations.host_disable_ssh
       ; flags= [Host_selectors]
       }
     )
@@ -1749,6 +1786,8 @@ let rec cmdtable_data : (string * cmd_spec) list =
           ; "host-password"
           ; "type"
           ; "remote-config"
+          ; "dry-run"
+          ; "metadata"
           ; "url"
           ; "vdi:"
           ]
@@ -1762,7 +1801,8 @@ let rec cmdtable_data : (string * cmd_spec) list =
            VDIs will be imported into the Pool's default SR unless an override \
            is provided. If the force option is given then any disk data \
            checksum failures will be ignored. If the parameter 'url' is \
-           specified, xapi will attempt to import from that URL."
+           specified, xapi will attempt to import from that URL. Only metadata \
+           will be imported if 'metadata' is true"
       ; implementation= With_fd Cli_operations.vm_import
       ; flags= [Standard]
       }
@@ -1776,6 +1816,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
           ; "compress"
           ; "metadata"
           ; "excluded-device-types"
+          ; "include-snapshots"
           ]
       ; help= "Export a VM to <filename>."
       ; implementation= With_fd Cli_operations.vm_export
@@ -1812,6 +1853,21 @@ let rec cmdtable_data : (string * cmd_spec) list =
            args:key:file=local_file can be used in place, where the content of \
            local_file will be retrieved and assigned to \"key\" as a whole."
       ; implementation= With_fd Cli_operations.vm_call_plugin
+      ; flags= []
+      }
+    )
+  ; ( "vm-call-host-plugin"
+    , {
+        reqd= ["vm-uuid"; "plugin"; "fn"]
+      ; optn= ["args:"]
+      ; help=
+          "Calls function fn within the plugin on the host where the VM is \
+           running with arguments (args:key=value). To pass a \"value\" string \
+           with special characters in it (e.g. new line), an alternative \
+           syntax args:key:file=local_file can be used in place, where the \
+           content of local_file will be retrieved and assigned to \"key\" as \
+           a whole."
+      ; implementation= With_fd Cli_operations.vm_call_host_plugin
       ; flags= []
       }
     )
@@ -2088,7 +2144,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
           "Create a VBD. Appropriate values for the device field are listed in \
            the parameter 'allowed-VBD-devices' on the VM. If no VDI is \
            specified, an empty VBD will be created. The type parameter can be \
-           'Disk' or 'CD', and the mode is 'RO' or 'RW'."
+           'Disk', 'CD' or 'Floppy', and the mode is 'RO' or 'RW'."
       ; implementation= No_fd Cli_operations.vbd_create
       ; flags= []
       }
@@ -2351,6 +2407,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
             "name-description"
           ; "sharable"
           ; "read-only"
+          ; "managed"
           ; "other-config:"
           ; "xenstore-data:"
           ; "sm-config:"
@@ -2709,6 +2766,15 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= []
       }
     )
+  ; ( "vm-sysprep"
+    , {
+        reqd= ["filename"]
+      ; optn= ["timeout"]
+      ; help= "Pass and execute sysprep configuration file"
+      ; implementation= With_fd Cli_operations.vm_sysprep
+      ; flags= [Vm_selectors]
+      }
+    )
   ; ( "diagnostic-vm-status"
     , {
         reqd= ["uuid"]
@@ -2720,17 +2786,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= [Standard]
       }
     )
-  ; (*
-   "diagnostic-event-deltas",
-    {
-      reqd=["class"];
-      optn=[];
-      help="Print the changes that are happening to all objects of class specified.";
-      implementation=With_fd Cli_operations.diagnostic_event_deltas;
-      flags=[];
-    };
-*)
-    ( "diagnostic-license-status"
+  ; ( "diagnostic-license-status"
     , {
         reqd= []
       ; optn= []
@@ -2839,7 +2895,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
   ; ( "host-evacuate"
     , {
         reqd= []
-      ; optn= ["network-uuid"]
+      ; optn= ["network-uuid"; "batch-size"]
       ; help= "Migrate all VMs off a host."
       ; implementation= No_fd Cli_operations.host_evacuate
       ; flags= [Host_selectors]
@@ -2950,35 +3006,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= []
       }
     )
-  ; (*
-   "alert-create",
-    {
-      reqd=["message"];
-      optn=["alert-level"];
-      help="Create a new alert.";
-      implementation=No_fd Cli_operations.alert_create;
-      flags=[];
-    };
-   "alert-destroy",
-    {
-      reqd=["uuid"];
-      optn=[];
-      help="Destroy an Alert.";
-      implementation=No_fd Cli_operations.alert_destroy;
-      flags=[];
-    };
-*)
-    (*
-   "host-fence",
-    {
-      reqd=["host-uuid"];
-      optn=[];
-      help="Fence a host";
-      implementation=No_fd_local_session Cli_operations.host_fence;
-      flags=[];
-    };
-*)
-    ( "pool-vlan-create"
+  ; ( "pool-vlan-create"
     , {
         reqd= ["pif-uuid"; "vlan"; "network-uuid"]
       ; optn= []
@@ -3107,6 +3135,28 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= []
       }
     )
+  ; ( "pool-enable-ssh"
+    , {
+        reqd= []
+      ; optn= []
+      ; help=
+          "Enable SSH access on all hosts in the pool. It's a helper which \
+           calls host.enable_ssh for all the hosts in the pool."
+      ; implementation= No_fd Cli_operations.pool_enable_ssh
+      ; flags= []
+      }
+    )
+  ; ( "pool-disable-ssh"
+    , {
+        reqd= []
+      ; optn= []
+      ; help=
+          "Disable SSH access on all hosts in the pool. It's a helper which \
+           calls host.disable_ssh for all the hosts in the pool."
+      ; implementation= No_fd Cli_operations.pool_disable_ssh
+      ; flags= []
+      }
+    )
   ; ( "host-ha-xapi-healthcheck"
     , {
         reqd= []
@@ -3117,28 +3167,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= [Hidden; Neverforward]
       }
     )
-  ; (*
-   "host-ha-query",
-    {
-      reqd=[];
-      optn=[];
-      help="Query the HA configuration of the local host.";
-      implementation=No_fd_local_session Cli_operations.host_ha_query;
-      flags=[Neverforward];
-    };
-
-*)
-    (*
-    "subject-list",
-    {
-      reqd=[];
-      optn=[];
-      help="Returns a list of subject names that can access the pool";
-      implementation=No_fd Cli_operations.subject_list;
-      flags=[]
-    };
-*)
-    ( "subject-add"
+  ; ( "subject-add"
     , {
         reqd= ["subject-name"]
       ; optn= []
@@ -3184,17 +3213,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= []
       }
     )
-  ; (* RBAC 2.0 only
-       "role-create",
-       {
-         reqd=["id";"name"];
-         optn=[];
-         help="Add a role to the pool";
-         implementation=No_fd Cli_operations.role_create;
-         flags=[]
-       };
-    *)
-    ( "session-subject-identifier-list"
+  ; ( "session-subject-identifier-list"
     , {
         reqd= []
       ; optn= []
@@ -3767,7 +3786,7 @@ let rec cmdtable_data : (string * cmd_spec) list =
   ; ( "vtpm-create"
     , {
         reqd= ["vm-uuid"]
-      ; optn= []
+      ; optn= ["is-unique"]
       ; help= "Create a VTPM associated with a VM."
       ; implementation= No_fd Cli_operations.VTPM.create
       ; flags= []
@@ -4004,7 +4023,6 @@ let rio_help printer minimal cmd =
         in
         printer (Cli_printer.PTable [recs])
     | None ->
-        D.log_backtrace () ;
         error "Responding with Unknown command %s" cmd ;
         printer (Cli_printer.PList ["Unknown command '" ^ cmd ^ "'"])
   in
@@ -4031,6 +4049,26 @@ let rio_help printer minimal cmd =
     let cmds =
       List.sort (fun (name1, _) (name2, _) -> compare name1 name2) cmds
     in
+    let help =
+      Printf.sprintf
+        {|Usage:
+  %s <command>
+    [ -s <server> ]            XenServer host
+    [ -p <port> ]              XenServer port number
+    [ -u <username> -pw <password> | -pwf <password file> ]
+                               User authentication (password or file)
+    [ --nossl ]                Disable SSL/TLS
+    [ --debug ]                Enable debug output
+    [ --debug-on-fail ]        Enable debug output only on failure
+    [ --traceparent <value> ]  Distributed tracing context
+    [ <other arguments> ... ]  Command-specific options
+
+To get help on a specific command:
+  %s help <command>
+
+|}
+        cmd.argv0 cmd.argv0
+    in
     if List.mem_assoc "all" cmd.params && List.assoc "all" cmd.params = "true"
     then
       let cmds = List.map fst cmds in
@@ -4040,20 +4078,9 @@ let rio_help printer minimal cmd =
       let vm_cmds, other =
         List.partition (fun n -> Astring.String.is_prefix ~affix:"vm-" n) other
       in
-      let h =
-        "Usage: "
-        ^ cmd.argv0
-        ^ " <command> [-s server] [-pw passwd] [-p port] [-u user] [-pwf \
-           password-file]\n"
-      in
-      let h = h ^ "  [command specific arguments]\n\n" in
-      let h =
-        h
-        ^ "To get help on a specific command: "
-        ^ cmd.argv0
-        ^ " help <command>\n\n"
-      in
-      let h = h ^ "Full command list\n-----------------" in
+      let h = help ^ {|Full command list
+-----------------
+|} in
       if minimal then
         printer (Cli_printer.PList cmds)
       else (
@@ -4070,25 +4097,16 @@ let rio_help printer minimal cmd =
       in
       let cmds = List.map fst cmds in
       let h =
-        "Usage: "
-        ^ cmd.argv0
-        ^ " <command> [-s server] [-pw passwd] [-p port] [-u user] [-pwf \
-           password-file]\n"
+        help
+        ^ Printf.sprintf
+            {|To get a full listing of commands:
+  %s help --all
+
+Common command list
+-------------------
+|}
+            cmd.argv0
       in
-      let h = h ^ "  [command specific arguments]\n\n" in
-      let h =
-        h
-        ^ "To get help on a specific command: "
-        ^ cmd.argv0
-        ^ " help <command>\n"
-      in
-      let h =
-        h
-        ^ "To get a full listing of commands: "
-        ^ cmd.argv0
-        ^ " help --all\n\n"
-      in
-      let h = h ^ "Common command list\n-------------------" in
       if minimal then
         printer (Cli_printer.PList cmds)
       else (

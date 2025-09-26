@@ -79,7 +79,8 @@ val restart_agent : __context:'a -> host:'b -> unit
 
 val shutdown_agent : __context:Context.t -> unit
 
-val disable : __context:Context.t -> host:[`host] Ref.t -> unit
+val disable :
+  __context:Context.t -> host:[`host] Ref.t -> auto_enable:bool -> unit
 
 val enable : __context:Context.t -> host:[`host] Ref.t -> unit
 
@@ -130,6 +131,11 @@ val create :
   -> ssl_legacy:bool
   -> last_software_update:API.datetime
   -> last_update_hash:string
+  -> ssh_enabled:bool
+  -> ssh_enabled_timeout:int64
+  -> ssh_expiry:API.datetime
+  -> console_idle_timeout:int64
+  -> ssh_auto_mode:bool
   -> [`host] Ref.t
 
 val destroy : __context:Context.t -> self:API.ref_host -> unit
@@ -563,3 +569,23 @@ val set_https_only :
   __context:Context.t -> self:API.ref_host -> value:bool -> unit
 
 val emergency_clear_mandatory_guidance : __context:Context.t -> unit
+
+val enable_ssh : __context:Context.t -> self:API.ref_host -> unit
+
+val disable_ssh : __context:Context.t -> self:API.ref_host -> unit
+
+val set_ssh_enabled_timeout :
+  __context:Context.t -> self:API.ref_host -> value:int64 -> unit
+
+val set_console_idle_timeout :
+  __context:Context.t -> self:API.ref_host -> value:int64 -> unit
+
+val schedule_disable_ssh_job :
+     __context:Context.t
+  -> self:API.ref_host
+  -> timeout:int64
+  -> auto_mode:bool
+  -> unit
+
+val set_ssh_auto_mode :
+  __context:Context.t -> self:API.ref_host -> value:bool -> unit

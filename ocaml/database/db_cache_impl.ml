@@ -19,6 +19,8 @@
       functions have the suffix "_locked" to clearly identify them.
    2. functions which only read must only call "get_database" once,
       to ensure they see a consistent snapshot.
+      With the exception of looking at the database schema, which is assumed to not change
+      concurrently.
 *)
 open Db_exn
 open Db_lock
@@ -34,6 +36,10 @@ open Db_ref
 
 let fist_delay_read_records_where = ref false
 
+type field_in = Schema.Value.t
+
+type field_out = Schema.maybe_cached_value
+
 (* Only needed by the DB_ACCESS signature *)
 let initialise () = ()
 
@@ -47,14 +53,13 @@ let is_valid_ref t objref =
 
 let read_field_internal _ tblname fldname objref db =
   try
-    Row.find fldname
+    Row.find' fldname
       (Table.find objref (TableSet.find tblname (Database.tableset db)))
   with Not_found -> raise (DBCache_NotFound ("missing row", tblname, objref))
 
 (* Read field from cache *)
 let read_field t tblname fldname objref =
-  Schema.Value.marshal
-    (read_field_internal t tblname fldname objref (get_database t))
+  read_field_internal t tblname fldname objref (get_database t)
 
 (** Finds the longest XML-compatible UTF-8 prefix of the given
     string, by truncating the string at the first incompatible
@@ -62,36 +67,49 @@ let read_field t tblname fldname objref =
     occurs. *)
 let ensure_utf8_xml string =
   let length = String.length string in
-  let prefix =
-    Xapi_stdext_encodings.Encodings.UTF8_XML.longest_valid_prefix string
-  in
+  let prefix = Xapi_stdext_encodings.Utf8.XML.longest_valid_prefix string in
   if length > String.length prefix then
     warn "string truncated to: '%s'." prefix ;
   prefix
+
+let ensure_utf8_xml_and_share string = string |> ensure_utf8_xml |> Share.merge
 
 (* Write field in cache *)
 let write_field_locked t tblname objref fldname newval =
   let current_val = get_field tblname objref fldname (get_database t) in
   if current_val <> newval then (
-    ( match newval with
-    | Schema.Value.String s ->
-        if not (Xapi_stdext_encodings.Encodings.UTF8_XML.is_valid s) then
-          raise Invalid_value
-    | _ ->
-        ()
-    ) ;
     update_database t (set_field tblname objref fldname newval) ;
     Database.notify
       (WriteField (tblname, objref, fldname, current_val, newval))
       (get_database t)
   )
 
+(** Ensure a value is conforming to UTF-8 with XML restrictions *)
+let is_valid v =
+  let valid = Xapi_stdext_encodings.Utf8.XML.is_valid in
+  let valid_pair (x, y) = valid x && valid y in
+  match v with
+  | Schema.Value.String s ->
+      valid s
+  | Schema.Value.Set ss ->
+      List.for_all valid ss
+  | Schema.Value.Pairs pairs ->
+      List.for_all valid_pair pairs
+
+let share_string = function
+  | Schema.Value.String s ->
+      Schema.Value.String (Share.merge s)
+  | v ->
+      (* we assume strings in the tree have been shared already *)
+      v
+
 let write_field t tblname objref fldname newval =
-  let db = get_database t in
-  let schema = Schema.table tblname (Database.schema db) in
-  let column = Schema.Table.find fldname schema in
-  let newval = Schema.Value.unmarshal column.Schema.Column.ty newval in
-  with_lock (fun () -> write_field_locked t tblname objref fldname newval)
+  if not @@ is_valid newval then
+    raise Invalid_value
+  else
+    with_lock (fun () ->
+        write_field_locked t tblname objref fldname (share_string newval)
+    )
 
 let touch_row t tblname objref =
   update_database t (touch tblname objref) ;
@@ -103,7 +121,7 @@ let touch_row t tblname objref =
    and iterates through set-refs [returning (fieldname, ref list) list; where fieldname is the
    name of the Set Ref field in tbl; and ref list is the list of foreign keys from related
    table with remote-fieldname=objref] *)
-let read_record_internal db tblname objref =
+let read_record_internal conv db tblname objref =
   try
     let tbl = TableSet.find tblname (Database.tableset db) in
     let row = Table.find objref tbl in
@@ -116,84 +134,80 @@ let read_record_internal db tblname objref =
       else
         None
     in
-    let map_fvlist v = Schema.Value.marshal v in
     (* Unfortunately the interface distinguishes between Set(Ref _) types and
        ordinary fields *)
     Row.fold
-      (fun k _ d (accum_fvlist, accum_setref) ->
+      (fun k _ cached (accum_fvlist, accum_setref) ->
         let accum_setref =
-          match map_setref_opt k d with
+          match map_setref_opt k (Schema.CachedValue.value_of cached) with
           | Some v ->
               (k, v) :: accum_setref
           | None ->
               accum_setref
         in
-        let accum_fvlist = (k, map_fvlist d) :: accum_fvlist in
+        let accum_fvlist = (k, conv cached) :: accum_fvlist in
         (accum_fvlist, accum_setref)
       )
       row ([], [])
   with Not_found -> raise (DBCache_NotFound ("missing row", tblname, objref))
 
-let read_record t = read_record_internal (get_database t)
+let read_record t =
+  read_record_internal Schema.CachedValue.open_present (get_database t)
 
 (* Delete row from tbl *)
 let delete_row_locked t tblname objref =
   try
-    W.debug "delete_row %s (%s)" tblname objref ;
     let tbl = TableSet.find tblname (Database.tableset (get_database t)) in
     let row = Table.find objref tbl in
     let db = get_database t in
     Database.notify (PreDelete (tblname, objref)) db ;
     update_database t (remove_row tblname objref) ;
     Database.notify
-      (Delete (tblname, objref, Row.fold (fun k _ v acc -> (k, v) :: acc) row [])
+      (Delete
+         ( tblname
+         , objref
+         , Row.fold
+             (fun k _ v acc -> (k, Schema.CachedValue.value_of v) :: acc)
+             row []
+         )
       )
       (get_database t)
   with Not_found -> raise (DBCache_NotFound ("missing row", tblname, objref))
 
 let delete_row t tblname objref =
+  W.debug "delete_row %s (%s)" tblname objref ;
   with_lock (fun () -> delete_row_locked t tblname objref)
 
 (* Create new row in tbl containing specified k-v pairs *)
 let create_row_locked t tblname kvs' new_objref =
   let db = get_database t in
-  let schema = Schema.table tblname (Database.schema db) in
-  let kvs' =
-    List.map
-      (fun (key, value) ->
-        let value = ensure_utf8_xml value in
-        let column = Schema.Table.find key schema in
-        (key, Schema.Value.unmarshal column.Schema.Column.ty value)
-      )
-      kvs'
-  in
-  (* we add the reference to the row itself so callers can use read_field_where to
-     	   return the reference: awkward if it is just the key *)
-  let kvs' = (Db_names.ref, Schema.Value.String new_objref) :: kvs' in
-  let g = Manifest.generation (Database.manifest (get_database t)) in
+  let g = Manifest.generation (Database.manifest db) in
   let row =
-    List.fold_left (fun row (k, v) -> Row.add g k v row) Row.empty kvs'
+    List.fold_left (fun row (k, v) -> Row.add' g k v row) Row.empty kvs'
   in
-  let schema = Schema.table tblname (Database.schema (get_database t)) in
+  let schema = Schema.table tblname (Database.schema db) in
   (* fill in default values if kv pairs for these are not supplied already *)
   let row = Row.add_defaults g schema row in
-  W.debug "create_row %s (%s) [%s]" tblname new_objref
-    (String.concat "," (List.map (fun (k, _) -> Printf.sprintf "(%s,v)" k) kvs')) ;
   update_database t (add_row tblname new_objref row) ;
   Database.notify
     (Create
-       (tblname, new_objref, Row.fold (fun k _ v acc -> (k, v) :: acc) row [])
+       ( tblname
+       , new_objref
+       , Row.fold
+           (fun k _ v acc -> (k, Schema.CachedValue.value_of v) :: acc)
+           row []
+       )
     )
     (get_database t)
 
 let fld_check t tblname objref (fldname, value) =
   let v =
-    Schema.Value.marshal
+    Schema.CachedValue.string_of
       (read_field_internal t tblname fldname objref (get_database t))
   in
-  (v = value, fldname, v)
+  (v = Schema.CachedValue.string_of value, fldname, v)
 
-let create_row t tblname kvs' new_objref =
+let create_row' t tblname kvs' new_objref =
   with_lock (fun () ->
       if is_valid_ref t new_objref then
         let uniq_check_list = List.map (fld_check t tblname new_objref) kvs' in
@@ -206,26 +220,65 @@ let create_row t tblname kvs' new_objref =
         | _ ->
             ()
       else
+        (* we add the reference to the row itself so callers can use read_field_where to
+           	   return the reference: awkward if it is just the key *)
+        let kvs' =
+          (Db_names.ref, Schema.Value.string new_objref |> Schema.CachedValue.v)
+          :: kvs'
+        in
+        W.debug "create_row %s (%s) [%s]" tblname new_objref
+          (String.concat ","
+             (List.map (fun (k, _) -> Printf.sprintf "(%s,v)" k) kvs')
+          ) ;
         create_row_locked t tblname kvs' new_objref
   )
 
+let create_row t tblname kvs' new_objref =
+  let kvs' =
+    List.map
+      (fun (key, value) ->
+        let value =
+          match value with
+          | Schema.Value.String x ->
+              Schema.Value.String (ensure_utf8_xml_and_share x)
+          | Schema.Value.Pairs ps ->
+              Schema.Value.Pairs
+                (List.map
+                   (fun (x, y) ->
+                     (ensure_utf8_xml_and_share x, ensure_utf8_xml_and_share y)
+                   )
+                   ps
+                )
+          | Schema.Value.Set xs ->
+              Schema.Value.Set (List.map ensure_utf8_xml_and_share xs)
+        in
+        (key, Schema.CachedValue.v value)
+      )
+      kvs'
+  in
+  create_row' t tblname kvs' new_objref
+
 (* Do linear scan to find field values which match where clause *)
-let read_field_where t rcd =
+let read_field_where' conv t rcd =
   let db = get_database t in
   let tbl = TableSet.find rcd.table (Database.tableset db) in
   Table.fold
     (fun _ _ row acc ->
-      let field = Schema.Value.marshal (Row.find rcd.where_field row) in
+      let field =
+        Schema.CachedValue.string_of (Row.find' rcd.where_field row)
+      in
       if field = rcd.where_value then
-        Schema.Value.marshal (Row.find rcd.return row) :: acc
+        conv (Row.find' rcd.return row) :: acc
       else
         acc
     )
     tbl []
 
+let read_field_where t rcd = read_field_where' Fun.id t rcd
+
 let db_get_by_uuid t tbl uuid_val =
   match
-    read_field_where t
+    read_field_where' Schema.CachedValue.string_of t
       {
         table= tbl
       ; return= Db_names.ref
@@ -242,7 +295,7 @@ let db_get_by_uuid t tbl uuid_val =
 
 let db_get_by_uuid_opt t tbl uuid_val =
   match
-    read_field_where t
+    read_field_where' Schema.CachedValue.string_of t
       {
         table= tbl
       ; return= Db_names.ref
@@ -257,7 +310,7 @@ let db_get_by_uuid_opt t tbl uuid_val =
 
 (** Return reference fields from tbl that matches specified name_label field *)
 let db_get_by_name_label t tbl label =
-  read_field_where t
+  read_field_where' Schema.CachedValue.string_of t
     {
       table= tbl
     ; return= Db_names.ref
@@ -291,17 +344,17 @@ let find_refs_with_filter_internal db (tblname : Db_interface.table)
 
 let find_refs_with_filter t = find_refs_with_filter_internal (get_database t)
 
-let read_records_where t tbl expr =
+let read_records_where' conv t tbl expr =
   let db = get_database t in
   let reqd_refs = find_refs_with_filter_internal db tbl expr in
   if !fist_delay_read_records_where then Thread.delay 0.5 ;
-  List.map (fun ref -> (ref, read_record_internal db tbl ref)) reqd_refs
+  List.map (fun ref -> (ref, read_record_internal conv db tbl ref)) reqd_refs
+
+let read_records_where t tbl expr =
+  read_records_where' Schema.CachedValue.open_present t tbl expr
 
 let process_structured_field_locked t (key, value) tblname fld objref
     proc_fn_selector =
-  (* Ensure that both keys and values are valid for UTF-8-encoded XML. *)
-  let key = ensure_utf8_xml key in
-  let value = ensure_utf8_xml value in
   try
     let tbl = TableSet.find tblname (Database.tableset (get_database t)) in
     let row = Table.find objref tbl in
@@ -338,6 +391,9 @@ let process_structured_field_locked t (key, value) tblname fld objref
 
 let process_structured_field t (key, value) tblname fld objref proc_fn_selector
     =
+  (* Ensure that both keys and values are valid for UTF-8-encoded XML. *)
+  let key = ensure_utf8_xml_and_share key in
+  let value = ensure_utf8_xml_and_share value in
   with_lock (fun () ->
       process_structured_field_locked t (key, value) tblname fld objref
         proc_fn_selector
@@ -426,24 +482,24 @@ let spawn_db_flush_threads () =
                    try
                      Thread.delay Db_backend.db_FLUSH_TIMER ;
                      (* If I have some writing capacity left in this write period then consider doing a write; or
-                        								   if the connection is not write-limited then consider doing a write too.
-                        								   We also have to consider doing a write if exit_on_next_flush is set: because when this is
-                        								   set (by a signal handler) we want to do a flush whether or not our write limit has been
-                        								   exceeded.
+                        if the connection is not write-limited then consider doing a write too.
+                        We also have to consider doing a write if exit_on_next_flush is set: because when this is
+                        set (by a signal handler) we want to do a flush whether or not our write limit has been
+                        exceeded.
                      *)
+                     (* always flush straight away; this request is urgent
+                        otherwise, we only write if
+                          (i) "coalesscing period has come to an end"; and
+                          (ii) "write limiting requirements are met": *)
                      ( if
                          !Db_connections.exit_on_next_flush
-                         (* always flush straight away; this request is urgent *)
-                         || (* otherwise, we only write if (i) "coalesscing period has come to an end"; and (ii) "write limiting requirements are met": *)
-                         (not (in_coallescing_period ()))
-                         (* see (i) above *)
-                         && (!my_writes_this_period
-                             < dbconn.Parse_db_conf.write_limit_write_cycles
-                            || dbconn.Parse_db_conf.mode
-                               = Parse_db_conf.No_limit
-                               (* (ii) above *)
-                            )
-                       then (* debug "[%s] considering flush" db_path; *)
+                         || (not (in_coallescing_period ()))
+                            && (!my_writes_this_period
+                                < dbconn.Parse_db_conf.write_limit_write_cycles
+                               || dbconn.Parse_db_conf.mode
+                                  = Parse_db_conf.No_limit
+                               )
+                       then
                          let was_anything_flushed =
                            Xapi_stdext_threads.Threadext.Mutex.execute
                              Db_lock.global_flush_mutex (fun () ->
@@ -453,7 +509,7 @@ let spawn_db_flush_threads () =
                          if was_anything_flushed then (
                            my_writes_this_period := !my_writes_this_period + 1 ;
                            (* when we do a write, reset the coallesce_period_start to now -- recall that this
-                              												   variable tracks the time since last write *)
+                              variable tracks the time since last write *)
                            coallesce_period_start := Unix.gettimeofday ()
                          )
                      ) ;
@@ -497,3 +553,41 @@ let stats t =
     )
     (Database.tableset (get_database t))
     []
+
+module Compat = struct
+  type field_in = string
+
+  type field_out = string
+
+  let read_field_where t rcd =
+    read_field_where' Schema.CachedValue.string_of t rcd
+
+  let read_field t tblname fldname objref =
+    read_field t tblname fldname objref |> Schema.CachedValue.string_of
+
+  let write_field t tblname objref fldname newval =
+    let db = get_database t in
+    let schema = Schema.table tblname (Database.schema db) in
+    let column = Schema.Table.find fldname schema in
+    let newval = Schema.Value.unmarshal column.Schema.Column.ty newval in
+    write_field t tblname objref fldname newval
+
+  let read_record t =
+    read_record_internal Schema.CachedValue.string_of (get_database t)
+
+  let read_records_where t tbl expr =
+    read_records_where' Schema.CachedValue.string_of t tbl expr
+
+  let create_row t tblname kvs' new_objref =
+    let db = get_database t in
+    let schema = Schema.table tblname (Database.schema db) in
+    let kvs' =
+      List.map
+        (fun (key, value) ->
+          let column = Schema.Table.find key schema in
+          (key, Schema.CachedValue.of_typed_string column.Schema.Column.ty value)
+        )
+        kvs'
+    in
+    create_row' t tblname kvs' new_objref
+end

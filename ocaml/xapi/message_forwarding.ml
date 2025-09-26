@@ -143,24 +143,15 @@ let do_op_on_common ~local_fn ~__context ~host ~remote_fn f =
       let task_opt = set_forwarding_on_task ~__context ~host in
       f __context host task_opt remote_fn
   with
-  | Xmlrpc_client.Connection_reset | Http_client.Http_request_rejected _ ->
-      warn
-        "Caught Connection_reset when contacting host %s; converting into \
-         CANNOT_CONTACT_HOST"
-        (Ref.string_of host) ;
-      raise
-        (Api_errors.Server_error
-           (Api_errors.cannot_contact_host, [Ref.string_of host])
-        )
-  | Xmlrpc_client.Stunnel_connection_failed ->
-      warn
-        "Caught Stunnel_connection_failed while contacting host %s; converting \
-         into CANNOT_CONTACT_HOST"
-        (Ref.string_of host) ;
-      raise
-        (Api_errors.Server_error
-           (Api_errors.cannot_contact_host, [Ref.string_of host])
-        )
+  | ( Xmlrpc_client.Connection_reset
+    | Http_client.Http_request_rejected _
+    | Xmlrpc_client.Stunnel_connection_failed ) as e
+  ->
+    error
+      "%s: Caught %s when contacting host %s; converting into \
+       CANNOT_CONTACT_HOST"
+      __FUNCTION__ (Printexc.to_string e) (Ref.string_of host) ;
+    raise Api_errors.(Server_error (cannot_contact_host, [Ref.string_of host]))
 
 (* regular forwarding fn, with session and live-check. Used by most calls, will
    use the connection cache. *)
@@ -1177,6 +1168,32 @@ functor
       let get_guest_secureboot_readiness ~__context ~self =
         info "%s: pool='%s'" __FUNCTION__ (pool_uuid ~__context self) ;
         Local.Pool.get_guest_secureboot_readiness ~__context ~self
+
+      let enable_ssh ~__context ~self =
+        info "%s: pool = '%s'" __FUNCTION__ (pool_uuid ~__context self) ;
+        Local.Pool.enable_ssh ~__context ~self
+
+      let disable_ssh ~__context ~self =
+        info "%s: pool = '%s'" __FUNCTION__ (pool_uuid ~__context self) ;
+        Local.Pool.disable_ssh ~__context ~self
+
+      let set_ssh_enabled_timeout ~__context ~self ~value =
+        info "Pool.set_ssh_enabled_timeout: pool='%s' value='%Ld'"
+          (pool_uuid ~__context self)
+          value ;
+        Local.Pool.set_ssh_enabled_timeout ~__context ~self ~value
+
+      let set_console_idle_timeout ~__context ~self ~value =
+        info "Pool.set_console_idle_timeout: pool='%s' value='%Ld'"
+          (pool_uuid ~__context self)
+          value ;
+        Local.Pool.set_console_idle_timeout ~__context ~self ~value
+
+      let set_ssh_auto_mode ~__context ~self ~value =
+        info "Pool.set_ssh_auto_mode: pool='%s' value='%b'"
+          (pool_uuid ~__context self)
+          value ;
+        Local.Pool.set_ssh_auto_mode ~__context ~self ~value
     end
 
     module VM = struct
@@ -2010,6 +2027,34 @@ functor
             forward_vm_op ~local_fn ~__context ~vm ~remote_fn
         )
 
+      let call_host_plugin ~__context ~vm ~plugin ~fn ~args =
+        info
+          "VM.call_host_plugin: VM = '%s'; plugin = '%s'; fn = '%s'; args = [ \
+           'hidden' ]"
+          (vm_uuid ~__context vm) plugin fn ;
+        let local_fn = Local.VM.call_host_plugin ~vm ~plugin ~fn ~args in
+        let remote_fn = Client.VM.call_host_plugin ~vm ~plugin ~fn ~args in
+        let power_state = Db.VM.get_power_state ~__context ~self:vm in
+        (* Insisting on running to make sure xenstore and domain exist
+           and the VM can react to xenstore events. Permitting Paused in
+           addition could be an option *)
+        if power_state <> `Running then
+          raise
+            Api_errors.(
+              Server_error
+                ( vm_bad_power_state
+                , [
+                    Ref.string_of vm
+                  ; Record_util.vm_power_state_to_string `Running
+                  ; Record_util.vm_power_state_to_string power_state
+                  ]
+                )
+            ) ;
+        with_vm_operation ~__context ~self:vm ~doc:"VM.call_host_plugin"
+          ~op:`call_plugin ~policy:Helpers.Policy.fail_immediately (fun () ->
+            forward_vm_op ~local_fn ~__context ~vm ~remote_fn
+        )
+
       let set_has_vendor_device ~__context ~self ~value =
         info "VM.set_has_vendor_device: VM = '%s' to %b"
           (vm_uuid ~__context self) value ;
@@ -2456,6 +2501,8 @@ functor
             let snapshot = Db.VM.get_record ~__context ~self:vm in
             reserve_memory_for_vm ~__context ~vm ~host ~snapshot
               ~host_op:`vm_migrate (fun () ->
+                if Db.VM.get_VGPUs ~__context ~self:vm <> [] then
+                  Xapi_stats.incr_pool_vgpu_migration_count () ;
                 forward_vm_op ~local_fn ~__context ~vm ~remote_fn
             )
         ) ;
@@ -2532,7 +2579,7 @@ functor
             forward_vm_op ~local_fn ~__context ~vm
               ~remote_fn:(fun ~rpc ~session_id ->
                 (* try InternalAsync.VM.migrate_send first to avoid long running idle stunnel connection
-                   * fall back on Async.VM.migrate_send if slave doesn't support InternalAsync *)
+                 * fall back on Async.VM.migrate_send if slave doesn't support InternalAsync *)
                 Helpers.try_internal_async ~__context API.ref_VM_of_rpc
                   (fun () ->
                     Client.InternalAsync.VM.migrate_send ~rpc ~session_id ~vm
@@ -2577,6 +2624,8 @@ functor
                   assert_can_migrate ~__context ~vm ~dest ~live ~vdi_map
                     ~vif_map ~vgpu_map ~options
               ) ;
+              if Db.VM.get_VGPUs ~__context ~self:vm <> [] then
+                Xapi_stats.incr_pool_vgpu_migration_count () ;
               forward_migrate_send ()
           )
         in
@@ -3066,16 +3115,28 @@ functor
         Xapi_vm_lifecycle.update_allowed_operations ~__context ~self
 
       let add_to_blocked_operations ~__context ~self ~key ~value =
-        info "VM.add_to_blocked_operations: self = '%s'"
-          (vm_uuid ~__context self) ;
+        info "VM.add_to_blocked_operations: self = '%s', key = '%s'"
+          (vm_uuid ~__context self)
+          (API.vm_operations_to_string key) ;
         Local.VM.add_to_blocked_operations ~__context ~self ~key ~value ;
         Xapi_vm_lifecycle.update_allowed_operations ~__context ~self
 
       let remove_from_blocked_operations ~__context ~self ~key =
-        info "VM.remove_from_blocked_operations: self = '%s'"
-          (vm_uuid ~__context self) ;
+        info "VM.remove_from_blocked_operations: self = '%s', key = '%s'"
+          (vm_uuid ~__context self)
+          (API.vm_operations_to_string key) ;
         Local.VM.remove_from_blocked_operations ~__context ~self ~key ;
         Xapi_vm_lifecycle.update_allowed_operations ~__context ~self
+
+      let sysprep ~__context ~self ~unattend ~timeout =
+        info "VM.sysprep: self = '%s'" (vm_uuid ~__context self) ;
+        let local_fn = Local.VM.sysprep ~self ~unattend ~timeout in
+        let remote_fn = Client.VM.sysprep ~self ~unattend ~timeout in
+        let policy = Helpers.Policy.fail_immediately in
+        with_vm_operation ~__context ~self ~doc:"VM.sysprep" ~op:`sysprep
+          ~policy (fun () ->
+            forward_vm_op ~local_fn ~__context ~vm:self ~remote_fn
+        )
     end
 
     module VM_metrics = struct end
@@ -3288,13 +3349,15 @@ functor
           (host_uuid ~__context host) ;
         Local.Host.get_management_interface ~__context ~host
 
-      let disable ~__context ~host =
-        info "Host.disable: host = '%s'" (host_uuid ~__context host) ;
+      let disable ~__context ~host ~auto_enable =
+        info "Host.disable: host = '%s', auto_enable = '%b'"
+          (host_uuid ~__context host)
+          auto_enable ;
         (* Block call if this would break our VM restart plan *)
         Xapi_ha_vm_failover.assert_host_disable_preserves_ha_plan ~__context
           host ;
-        let local_fn = Local.Host.disable ~host in
-        let remote_fn = Client.Host.disable ~host in
+        let local_fn = Local.Host.disable ~host ~auto_enable in
+        let remote_fn = Client.Host.disable ~host ~auto_enable in
         do_op_on ~local_fn ~__context ~host ~remote_fn ;
         Xapi_host_helpers.update_allowed_operations ~__context ~self:host
 
@@ -4015,6 +4078,42 @@ functor
       let emergency_clear_mandatory_guidance ~__context =
         info "Host.emergency_clear_mandatory_guidance" ;
         Local.Host.emergency_clear_mandatory_guidance ~__context
+
+      let enable_ssh ~__context ~self =
+        info "%s: host = '%s'" __FUNCTION__ (host_uuid ~__context self) ;
+        let local_fn = Local.Host.enable_ssh ~self in
+        let remote_fn = Client.Host.enable_ssh ~self in
+        do_op_on ~local_fn ~__context ~host:self ~remote_fn
+
+      let disable_ssh ~__context ~self =
+        info "%s: host = '%s'" __FUNCTION__ (host_uuid ~__context self) ;
+        let local_fn = Local.Host.disable_ssh ~self in
+        let remote_fn = Client.Host.disable_ssh ~self in
+        do_op_on ~local_fn ~__context ~host:self ~remote_fn
+
+      let set_ssh_enabled_timeout ~__context ~self ~value =
+        info "Host.set_ssh_enabled_timeout: host='%s' value='%Ld'"
+          (host_uuid ~__context self)
+          value ;
+        let local_fn = Local.Host.set_ssh_enabled_timeout ~self ~value in
+        let remote_fn = Client.Host.set_ssh_enabled_timeout ~self ~value in
+        do_op_on ~local_fn ~__context ~host:self ~remote_fn
+
+      let set_console_idle_timeout ~__context ~self ~value =
+        info "Host.set_console_idle_timeout: host='%s' value='%Ld'"
+          (host_uuid ~__context self)
+          value ;
+        let local_fn = Local.Host.set_console_idle_timeout ~self ~value in
+        let remote_fn = Client.Host.set_console_idle_timeout ~self ~value in
+        do_op_on ~local_fn ~__context ~host:self ~remote_fn
+
+      let set_ssh_auto_mode ~__context ~self ~value =
+        info "Host.set_ssh_auto_mode: host='%s' value='%b'"
+          (host_uuid ~__context self)
+          value ;
+        let local_fn = Local.Host.set_ssh_auto_mode ~self ~value in
+        let remote_fn = Client.Host.set_ssh_auto_mode ~self ~value in
+        do_op_on ~local_fn ~__context ~host:self ~remote_fn
     end
 
     module Host_crashdump = struct
@@ -5643,14 +5742,21 @@ functor
             if Helpers.i_am_srmaster ~__context ~sr then
               List.iter
                 (fun vdi ->
-                  if Db.VDI.get_current_operations ~__context ~self:vdi <> []
-                  then
-                    raise
-                      (Api_errors.Server_error
-                         ( Api_errors.other_operation_in_progress
-                         , [Datamodel_common._vdi; Ref.string_of vdi]
-                         )
-                      )
+                  match Db.VDI.get_current_operations ~__context ~self:vdi with
+                  | (op_ref, op_type) :: _ ->
+                      raise
+                        (Api_errors.Server_error
+                           ( Api_errors.other_operation_in_progress
+                           , [
+                               Datamodel_common._vdi
+                             ; Ref.string_of vdi
+                             ; API.vdi_operations_to_string op_type
+                             ; op_ref
+                             ]
+                           )
+                        )
+                  | [] ->
+                      ()
                 )
                 (Db.SR.get_VDIs ~__context ~self:sr) ;
             SR.mark_sr ~__context ~sr ~doc ~op
@@ -6304,7 +6410,7 @@ functor
         let remote_fn = Client.Cluster_host.forget ~self in
         (* We need to ask another host that has a cluster host to mark it as dead.
          * We might've run force destroy and this host would no longer have a cluster host
-         * *)
+         *)
         let other_hosts =
           Db.Cluster.get_cluster_hosts ~__context ~self:cluster
           |> List.filter (( <> ) self)

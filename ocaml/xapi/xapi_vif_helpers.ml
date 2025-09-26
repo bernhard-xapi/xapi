@@ -50,18 +50,20 @@ let valid_operations ~__context record _ref' : table =
   in
   let vm = Db.VIF.get_VM ~__context ~self:_ref' in
   (* Any current_operations preclude everything else *)
-  if current_ops <> [] then (
-    debug "No operations are valid because current-operations = [ %s ]"
-      (String.concat "; "
-         (List.map
-            (fun (task, op) -> task ^ " -> " ^ vif_operations_to_string op)
-            current_ops
-         )
-      ) ;
-    let concurrent_op = snd (List.hd current_ops) in
-    set_errors Api_errors.other_operation_in_progress
-      ["VIF"; _ref; vif_operations_to_string concurrent_op]
-      all_ops
+  ( if current_ops <> [] then
+      let concurrent_op_refs, concurrent_op_types =
+        List.fold_left
+          (fun (refs, types) (ref, op) ->
+            (ref :: refs, vif_operations_to_string op :: types)
+          )
+          ([], []) current_ops
+      in
+      let format x = Printf.sprintf "{%s}" (String.concat "; " x) in
+      let concurrent_op_refs = format concurrent_op_refs in
+      let concurrent_op_types = format concurrent_op_types in
+      set_errors Api_errors.other_operation_in_progress
+        ["VIF"; _ref; concurrent_op_types; concurrent_op_refs]
+        all_ops
   ) ;
   (* No hotplug on dom0 *)
   if Helpers.is_domain_zero ~__context vm then
@@ -192,10 +194,11 @@ let clear_current_operations ~__context ~self =
 
 (**************************************************************************************)
 
-(** Check if the device string has the right form *)
+(** Check if the device string has the right form - it should only be an
+    unsigned decimal integer *)
 let valid_device dev =
   try
-    ignore (int_of_string dev) ;
+    Scanf.sscanf dev "%u%!" ignore ;
     true
   with _ -> false
 
@@ -264,19 +267,18 @@ let create ~__context ~device ~network ~vM ~mAC ~mTU ~other_config
     raise (Api_errors.Server_error (Api_errors.mac_invalid, [mAC])) ;
   (* Make people aware that non-shared networks being added to VMs makes them not agile *)
   let pool = Helpers.get_pool ~__context in
-  if
-    true
-    && Db.Pool.get_ha_enabled ~__context ~self:pool
-    && (not (Db.Pool.get_ha_allow_overcommit ~__context ~self:pool))
-    && Helpers.is_xha_protected ~__context ~self:vM
-    && not (Agility.is_network_properly_shared ~__context ~self:network)
-  then (
-    warn "Creating VIF %s makes VM %s not agile" (Ref.string_of ref)
-      (Ref.string_of vM) ;
-    raise
-      (Api_errors.Server_error
-         (Api_errors.ha_operation_would_break_failover_plan, [])
-      )
+  ( if
+      true
+      && Db.Pool.get_ha_enabled ~__context ~self:pool
+      && (not (Db.Pool.get_ha_allow_overcommit ~__context ~self:pool))
+      && Helpers.is_xha_protected ~__context ~self:vM
+      && not (Agility.is_network_properly_shared ~__context ~self:network)
+    then
+      let net = Ref.string_of network in
+      raise
+        Api_errors.(
+          Server_error (ha_constraint_violation_network_not_shared, [net])
+        )
   ) ;
   (* Check to make sure the device is unique *)
   Xapi_stdext_threads.Threadext.Mutex.execute m (fun () ->
@@ -288,8 +290,7 @@ let create ~__context ~device ~network ~vM ~mAC ~mTU ~other_config
       in
       let new_device = int_of_string device in
       if List.exists (fun (_, d) -> d = new_device) all_vifs_with_devices then
-        raise
-          (Api_errors.Server_error (Api_errors.device_already_exists, [device])) ;
+        raise Api_errors.(Server_error (device_already_exists, [device])) ;
 
       (* If the VM uses a PVS_proxy, then the proxy _must_ be associated with
          the VIF that has the lowest device number. Check that the new VIF

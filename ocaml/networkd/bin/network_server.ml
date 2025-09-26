@@ -412,12 +412,23 @@ module Interface = struct
                 Ip.set_ipv6_link_local_addr name
               )
           | DHCP6 ->
+              let gateway =
+                Option.fold ~none:[]
+                  ~some:(fun n -> [`gateway n])
+                  !config.gateway_interface
+              in
+              let dns =
+                Option.fold ~none:[]
+                  ~some:(fun n -> [`dns n])
+                  !config.dns_interface
+              in
               if Dhclient.is_running ~ipv6:true name then
                 ignore (Dhclient.stop ~ipv6:true name) ;
               Sysctl.set_ipv6_autoconf name false ;
               Ip.flush_ip_addr ~ipv6:true name ;
               Ip.set_ipv6_link_local_addr name ;
-              ignore (Dhclient.ensure_running ~ipv6:true name [])
+              let options = gateway @ dns in
+              ignore (Dhclient.ensure_running ~ipv6:true name options)
           | Autoconf6 ->
               if Dhclient.is_running ~ipv6:true name then
                 ignore (Dhclient.stop ~ipv6:true name) ;
@@ -543,7 +554,8 @@ module Interface = struct
   let set_dns _ dbg ~name ~nameservers ~domains =
     Debug.with_thread_associated dbg
       (fun () ->
-        update_config name {(get_config name) with dns= (nameservers, domains)} ;
+        update_config name
+          {(get_config name) with dns= Some (nameservers, domains)} ;
         debug "Configuring DNS for %s: nameservers: [%s]; domains: [%s]" name
           (String.concat ", " (List.map Unix.string_of_inet_addr nameservers))
           (String.concat ", " domains) ;
@@ -716,7 +728,7 @@ module Interface = struct
                   ; ipv6_conf
                   ; ipv6_gateway
                   ; ipv4_routes
-                  ; dns= nameservers, domains
+                  ; dns
                   ; mtu
                   ; ethtool_settings
                   ; ethtool_offload
@@ -725,16 +737,13 @@ module Interface = struct
                 ) ) ->
                 update_config name c ;
                 exec (fun () ->
-                    (* We only apply the DNS settings when not in a DHCP mode
-                       to avoid conflicts. The `dns` field
-                       should really be an option type so that we don't have to
-                       derive the intention of the caller by looking at other
-                       fields. *)
-                    match (ipv4_conf, ipv6_conf) with
-                    | Static4 _, _ | _, Static6 _ | _, Autoconf6 ->
-                        set_dns () dbg ~name ~nameservers ~domains
-                    | _ ->
+                    (* Old configs used empty dns lists to mean none, keep that
+                       behaviour instead of writing an empty resolv.conf *)
+                    match dns with
+                    | None | Some ([], []) ->
                         ()
+                    | Some (nameservers, domains) ->
+                        set_dns () dbg ~name ~nameservers ~domains
                 ) ;
                 exec (fun () -> set_ipv4_conf dbg name ipv4_conf) ;
                 exec (fun () ->
@@ -924,12 +933,6 @@ module Bridge = struct
                   "standalone"
                 )
             in
-            let vlan_bug_workaround =
-              if List.mem_assoc "vlan-bug-workaround" other_config then
-                Some (List.assoc "vlan-bug-workaround" other_config = "true")
-              else
-                None
-            in
             let external_id =
               if List.mem_assoc "network-uuids" other_config then
                 Some
@@ -957,7 +960,7 @@ module Bridge = struct
             Option.iter (destroy_existing_vlan_ovs_bridge dbg name) vlan ;
             ignore
               (Ovs.create_bridge ?mac ~fail_mode ?external_id ?disable_in_band
-                 ?igmp_snooping vlan vlan_bug_workaround name
+                 ?igmp_snooping vlan name
               ) ;
             if igmp_snooping = Some true && not old_igmp_snooping then
               Ovs.inject_igmp_query ~name
